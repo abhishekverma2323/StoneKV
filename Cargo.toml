@@ -1,0 +1,15 @@
+[package]
+name = "stone"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# intentionally empty - zero third-party runtime dependencies
+
+[[bin]]
+name = "stone"
+path = "src/main.rs"
+
+[lib]
+name = "stone"
+path = "src/lib.rs"
