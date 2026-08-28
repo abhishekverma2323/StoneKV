@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# intentionally empty - zero third-party runtime dependencies
+# intentionally empty — zero third-party runtime dependencies
 
 [[bin]]
 name = "stone"
@@ -13,3 +13,8 @@ path = "src/main.rs"
 [lib]
 name = "stone"
 path = "src/lib.rs"
+
+[[bench]]
+name = "throughput"
+path = "benches/throughput.rs"
+harness = false
