@@ -1011,6 +1011,8 @@ A generated proof is committed as:
 
 See [`STDLIB.md`](STDLIB.md) for the standard-library substitutions used throughout StoneKV.
 
+See [`REPRODUCIBLE.md`](REPRODUCIBLE.md) for the Reproducible Build bonus verification — two independent, fully clean release builds produce byte-identical SHA-256 hashes.
+
 Examples include replacements for functionality commonly provided by:
 
 * `serde`

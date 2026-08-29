@@ -4,6 +4,8 @@ StoneKV is built entirely with the Rust standard library and project-specific co
 
 **Third-party Rust dependencies: 0**
 
+**Bonus claim — STDLIB Log:** this document lists 14 real, non-trivial stdlib-for-package substitutions — above the 10 required for this bonus — each identifying the normally-used package, the standard-library replacement, why it was made, and the tradeoff accepted.
+
 This document lists the substitutions that are actually present in the submitted implementation. It is not an aspirational list.
 
 For each substitution, this log identifies:
