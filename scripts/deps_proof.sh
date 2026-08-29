@@ -9,7 +9,11 @@ cd "$ROOT_DIR"
 echo "=== Cargo.toml dependencies ==="
 echo
 
-grep -A 3 '^\[dependencies\]' Cargo.toml || true
+awk '
+/^\[dependencies\]$/ { print; in_deps=1; next }
+in_deps && /^\[/ { exit }
+in_deps { print }
+' Cargo.toml
 
 echo
 echo "=== cargo tree -e normal ==="
@@ -31,7 +35,11 @@ echo
     echo
     echo "Cargo.toml [dependencies] section:"
     echo
-    grep -A 3 '^\[dependencies\]' Cargo.toml || true
+    awk '
+    /^\[dependencies\]$/ { print; in_deps=1; next }
+    in_deps && /^\[/ { exit }
+    in_deps { print }
+    ' Cargo.toml
     echo
     echo "-------------------------------------------------------------------"
     echo "Full cargo metadata (--no-deps) below, for machine verification."

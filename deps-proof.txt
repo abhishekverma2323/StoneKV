@@ -10,7 +10,6 @@ Cargo.toml [dependencies] section:
 [dependencies]
 # intentionally empty — zero third-party runtime dependencies
 
-[[bin]]
 
 -------------------------------------------------------------------
 Full cargo metadata (--no-deps) below, for machine verification.
