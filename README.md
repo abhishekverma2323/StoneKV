@@ -4,7 +4,18 @@
 
 **Zero Dependency Hackathon 2026 — Track D: Data & Storage**
 
-StoneKV is a small log-structured storage engine implemented entirely with the Rust standard library. It provides persistent `set`, `get`, and `delete` operations through both a command-line interface and an embeddable Rust API.
+StoneKV is a crash-safe, log-structured embedded key-value store built entirely with Rust's standard library — zero external crates. Unlike a basic file-backed key-value store, StoneKV implements a synced write-ahead log, physical crash-tail recovery, immutable indexed segments, full compaction, and a second, independent recovery protocol for crashes that happen *during* compaction itself.
+
+### Why it stands out
+
+* **Zero crates** — even CRC32, CLI parsing, the WAL, and binary record serialization are handwritten, not delegated to a library.
+* **Durable writes** — every write's WAL entry is `sync_all()`'d before the write is acknowledged.
+* **Crash recovery** — an incomplete final WAL write is detected and the invalid tail is physically removed on restart, not just skipped in memory.
+* **Crash-safe compaction** — compaction has its own recovery transaction. A synced `compaction.pending` marker lets StoneKV recover tested process-crash states before serving reads, preventing old segments from resurrecting a deleted value after an interrupted compaction.
+* **Tested failure modes, not just happy paths** — 117 unit and integration tests, including WAL checksum corruption, interrupted-compaction rollback, interrupted-compaction completion, and deleted-value resurrection prevention.
+* **Honest about its limits** — where a guarantee doesn't fully hold (see "Honest Limitations" below), it's documented and tested as a known boundary rather than hidden.
+
+StoneKV provides persistent `set`, `get`, and `delete` operations through both a command-line interface and an embeddable Rust library API.
 
 Its goal is simple:
 
@@ -36,40 +47,6 @@ Its goal is simple:
 * CLI and embeddable Rust API
 * Single-process threaded access through `Arc<Mutex<Store>>`
 * **Zero third-party Rust dependencies**
-
----
-
-## Requirements
-
-* **Minimum Rust version:** Rust 1.80+
-* **Validated environment:** `rustc 1.97.1` and `cargo 1.97.1`
-* No third-party Rust crates
-
-Rust 1.80+ is required because StoneKV uses `std::sync::LazyLock`.
-
----
-
-## Build
-
-StoneKV builds with one command:
-
-```bash
-cargo build --release
-```
-
-The release binary is produced at:
-
-### Windows
-
-```text
-target\release\stone.exe
-```
-
-### Linux / macOS
-
-```text
-target/release/stone
-```
 
 ---
 
@@ -137,7 +114,7 @@ stone help
 
 ---
 
-## 4. Store and retrieve arbitrary data
+## 4. Store and retrieve a value
 
 ### Windows
 
@@ -183,6 +160,40 @@ OK
 ```
 
 Using `--dir` lets reviewers create isolated stores without modifying the default `./stone-data` directory.
+
+---
+
+## Requirements
+
+* **Minimum expected Rust version:** 1.80+ (required for `std::sync::LazyLock`)
+* **Validated environment:** `rustc 1.97.1` and `cargo 1.97.1`
+* No third-party Rust crates
+
+Rust 1.80+ is required because StoneKV uses `std::sync::LazyLock`.
+
+---
+
+## Build
+
+StoneKV builds with one command:
+
+```bash
+cargo build --release
+```
+
+The release binary is produced at:
+
+### Windows
+
+```text
+target\release\stone.exe
+```
+
+### Linux / macOS
+
+```text
+target/release/stone
+```
 
 ---
 
@@ -970,9 +981,28 @@ The harness measures:
 * verification time
 * full compaction
 
-Write throughput should be interpreted carefully because each acknowledged write performs `File::sync_all()`.
+**Results:**
 
-Numbers are intentionally not hard-coded into this README because results depend heavily on the operating system, filesystem, storage device, and durability semantics.
+| Environment | Value |
+|---|---|
+| CPU | 12th Gen Intel(R) Core(TM) i5-1235U |
+| OS | Windows 11 + WSL2 (Ubuntu), benchmark directory on `/dev/sdd` (ext4) |
+| Rust | `rustc 1.97.1` |
+| Build | `cargo bench` (release profile) |
+
+| Operation | Result |
+|---|---|
+| Durable sequential writes | 193.61 ops/sec |
+| Reads | 95,868.79 ops/sec |
+| Store reopen | 0.54 ms |
+| Verify | 8.50 ms |
+| Full compaction | 48.47 ms |
+
+**Methodology note:** benchmark results are sensitive to the filesystem backing the benchmark directory, since every acknowledged write calls `File::sync_all()`. An initial run of this benchmark used the default `TMPDIR`, which on this WSL2 system resolves to `/tmp` — confirmed via `mount | grep " /tmp "` and `df -T /tmp` to be `tmpfs` (RAM-backed). `sync_all()` against `tmpfs` has no physical device to flush, which produced an artificially high write number (roughly 765,000 ops/sec) that does not reflect real disk-backed durability cost. The results published above were instead captured with `TMPDIR=~/bench-tmp`, confirmed via `findmnt -T ~/bench-tmp` and `df -T ~/bench-tmp` to be mounted on `/dev/sdd`, filesystem type `ext4`. Before comparing these results across machines, verify the filesystem backing your own benchmark directory with `findmnt` or `df -T` — do not assume a "temp" directory is disk-backed.
+
+**Each acknowledged write calls `File::sync_all()`, so write throughput reflects synchronous, durable-on-return semantics rather than buffered or asynchronous writes.** The write result should therefore be interpreted in the context of synchronous durability: StoneKV intentionally trades throughput for completing `File::sync_all()` before acknowledging each write. It is not attempting to compete with a write-buffered or asynchronous engine on raw throughput. Reads do not perform `sync_all()` on every operation, while acknowledged writes do. Many repeated segment reads may also benefit from the operating system's page cache, and the newest unflushed records may be served directly from the memtable. The large difference between read and write throughput is therefore consistent with StoneKV's deliberately synchronous write-durability model, but should not be interpreted as a universal performance ratio.
+
+Absolute numbers will vary across machines, operating systems, and storage devices — the table above should be read as evidence that the system works and behaves as described, not as a cross-platform performance claim.
 
 ---
 
@@ -1011,7 +1041,7 @@ A generated proof is committed as:
 
 See [`STDLIB.md`](STDLIB.md) for the standard-library substitutions used throughout StoneKV.
 
-See [`REPRODUCIBLE.md`](REPRODUCIBLE.md) for the Reproducible Build bonus verification — two independent, fully clean release builds produce byte-identical SHA-256 hashes.
+See [`REPRODUCIBLE.md`](REPRODUCIBLE.md) for the Reproducible Build bonus verification. In the documented Linux/WSL environment, two fully clean release builds produced byte-identical SHA-256 hashes under the same machine and toolchain.
 
 Examples include replacements for functionality commonly provided by:
 
