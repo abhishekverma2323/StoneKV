@@ -18,9 +18,27 @@ echo
 cargo tree -e normal
 
 echo
-echo "=== generating deps-proof.txt ==="
+echo "=== generating deps-proof.txt (human-readable summary + full cargo metadata) ==="
 echo
 
-cargo metadata --format-version 1 --no-deps > deps-proof.txt
+{
+    echo "StoneKV dependency proof"
+    echo "========================="
+    echo
+    echo "Quick check (cargo tree -e normal):"
+    echo
+    cargo tree -e normal
+    echo
+    echo "Cargo.toml [dependencies] section:"
+    echo
+    grep -A 3 '^\[dependencies\]' Cargo.toml || true
+    echo
+    echo "-------------------------------------------------------------------"
+    echo "Full cargo metadata (--no-deps) below, for machine verification."
+    echo "The field to check is \"dependencies\":[] on the \"stone\" package."
+    echo "-------------------------------------------------------------------"
+    echo
+    cargo metadata --format-version 1 --no-deps
+} > deps-proof.txt
 
 echo "dependency proof written to deps-proof.txt"
