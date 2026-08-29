@@ -396,6 +396,102 @@ mod tests {
     }
 
     #[test]
+    fn corrupted_length_field_is_not_silently_truncated_away() {
+        // Regression test for the ambiguity between "genuine crash tail"
+        // and "corrupted length field that merely looks incomplete".
+        //
+        // Before the MAX_FIELD_LEN sanity bound in record.rs, a corrupted
+        // key_len/val_len field made Record::decode return
+        // TruncatedRecord purely because the (bogus) declared length
+        // exceeded the bytes remaining in the file. Wal::replay treats
+        // TruncatedRecord as a forgivable crash tail and physically
+        // discards it — silently losing the record and shrinking the WAL,
+        // with only a misleading "truncated WAL tail" warning logged.
+        //
+        // This must now surface as a hard error instead.
+        let path = temp_path("corrupted_length_field");
+
+        let record = Record::new_set(b"key".to_vec(), b"value".to_vec());
+        let mut encoded = record.encode().unwrap();
+
+        // Smash key_len (bytes[1..5]) to an implausibly large value.
+        encoded[1] = 0xFF;
+        encoded[2] = 0xFF;
+        encoded[3] = 0xFF;
+        encoded[4] = 0x7F;
+
+        let original_len = encoded.len() as u64;
+
+        fs::write(&path, &encoded).unwrap();
+
+        let result = Wal::replay(&path, |_| {});
+
+        assert!(
+            matches!(result, Err(StoneError::CorruptRecord { .. })),
+            "expected CorruptRecord, got {:?}",
+            result
+        );
+
+        // Critically: the file must NOT have been truncated. A silent
+        // truncate-and-continue here would mean data loss with no
+        // durable trace that anything went wrong.
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            original_len,
+            "WAL file was modified even though replay reported an error"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn corrupted_length_field_in_non_final_record_is_also_rejected() {
+        // Uses an implausibly large corrupted length (past MAX_FIELD_LEN),
+        // which is what this mechanism actually catches. This does not
+        // generalize to moderate length corruption that stays under
+        // MAX_FIELD_LEN — that case remains genuinely indistinguishable
+        // from a crash tail under this record format. See
+        // record::tests::moderate_length_corruption_is_still_indistinguishable_from_truncation
+        // for that documented, unresolved case.
+        let path = temp_path("corrupted_length_field_non_final");
+
+        let victim = Record::new_set(b"key1".to_vec(), b"value1".to_vec());
+        let mut victim_bytes = victim.encode().unwrap();
+
+        victim_bytes[1] = 0xFF;
+        victim_bytes[2] = 0xFF;
+        victim_bytes[3] = 0xFF;
+        victim_bytes[4] = 0x7F;
+
+        let following = Record::new_set(b"key2".to_vec(), b"value2".to_vec());
+        let following_bytes = following.encode().unwrap();
+
+        let mut contents = Vec::new();
+        contents.extend_from_slice(&victim_bytes);
+        contents.extend_from_slice(&following_bytes);
+
+        let original_len = contents.len() as u64;
+
+        fs::write(&path, &contents).unwrap();
+
+        let result = Wal::replay(&path, |_| {});
+
+        assert!(
+            matches!(result, Err(StoneError::CorruptRecord { .. })),
+            "expected CorruptRecord, got {:?}",
+            result
+        );
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            original_len,
+            "WAL file was modified even though replay reported an error"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn delete_record_replays_correctly() {
         let path = temp_path("delete");
 

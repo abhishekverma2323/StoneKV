@@ -496,6 +496,52 @@ delete old segments
 
 Old segments are never deleted before the replacement segment is written, synced, renamed, and successfully opened.
 
+### Compaction Crash Recovery
+
+The compaction flow above has one more durability layer beyond what the diagram shows: a **transaction marker** that survives a crash occurring anywhere between "new segment installed" and "old segments deleted."
+
+This matters because full compaction deletes multiple old segment files one at a time, and a process crash partway through that deletion loop would otherwise leave the store in an ambiguous state — some old segments gone, some still present, with no record of what the compaction was even trying to do.
+
+Stone closes that gap with `compaction.pending`, a small durable marker file written to the `segments/` directory:
+
+```text
+build compacted segment.tmp
+       |
+       v
+sync_all
+       |
+       v
+write compaction.pending  <-- records: output generation,
+       |                        old generations being replaced
+       v
+rename segment.tmp -> final .seg
+       |
+       v
+validate final segment
+       |
+       v
+old segments deleted one by one
+       |
+       v
+delete compaction.pending
+```
+
+The marker is written **before** the compacted segment is renamed into place, and deleted **only after every replaced old segment has actually been removed**. That ordering means the marker's mere presence at startup is itself the signal that a compaction transaction was interrupted, and its contents (which generation was being produced, which old generations it was replacing) are exactly what's needed to finish or roll back that transaction correctly.
+
+At `Store::open()`, before anything else loads, `recover_pending_compaction()` inspects `segments/` and resolves every case a crash could have left behind:
+
+| Crash point | What's on disk | Recovery action |
+|---|---|---|
+| Before the marker was written | No `compaction.pending` | Nothing to recover — old segments are untouched and still authoritative. |
+| After `compaction.pending.tmp` written, before rename to `compaction.pending` | Only the temp marker file | Temp marker is discarded as a leftover of a transaction that never actually became active. |
+| After the marker is active, before the final segment exists | `compaction.pending` + old segments, no new `.seg` | Rolled back: any stray `.tmp` segment is removed, the marker is removed, old segments remain authoritative. |
+| After the final segment is installed, before old segments are deleted | `compaction.pending` + new segment + some/all old segments | Rolled **forward**: the new segment is re-validated (opened and structurally checked), then any remaining old segments named in the marker are deleted, then the marker is removed. |
+| After every old segment is deleted, before the marker itself is removed | `compaction.pending` + new segment only | Marker is simply removed — cleanup was already complete. |
+
+The key design decision is that recovery always re-validates the new compacted segment (open + structural check) before trusting it and deleting anything else. If that validation fails, Stone does not delete the old segments — it fails loudly instead of destroying the only good copy of the data. This is why `compact()`'s in-process rollback logic and `recover_pending_compaction()`'s crash-time recovery logic follow the identical rule: **never delete data you haven't first confirmed has a valid replacement on disk.**
+
+This is tested directly in `store::tests::interrupted_compaction_before_install_rolls_back` and `store::tests::interrupted_compaction_does_not_resurrect_deleted_key`, and is one of the places Stone's implementation goes beyond what a minimal full-compaction design strictly requires.
+
 ## Statistics
 
 ```bash
@@ -713,6 +759,8 @@ Stone currently does not provide:
 * power-controller fault testing
 
 Stone prioritizes a small, explainable, durable core rather than feature breadth.
+
+**On length-field corruption specifically:** Stone rejects a `key_len`/`val_len` field corrupted to an implausibly large value (see `MAX_FIELD_LEN` in `record.rs`) as corruption rather than silently discarding it as a crash tail. It does **not** fully solve the general problem — a length field corrupted to a moderate, still-plausible value that happens to exceed the bytes actually remaining is indistinguishable from a genuine interrupted write under this record format, since the CRC that would catch the mismatch lives at the end of the record. Fully closing this would require additional framing/integrity metadata (an on-disk format change), which is out of scope here. This is documented and intentionally left as a known, tested limitation rather than an unexamined gap — see `record::tests::moderate_length_corruption_is_still_indistinguishable_from_truncation`.
 
 ## Project Structure
 

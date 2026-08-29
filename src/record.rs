@@ -9,6 +9,35 @@ const CRC_SIZE: usize = 4;
 const KEY_LEN_OFFSET: usize = 1;
 const KEY_START_OFFSET: usize = KEY_LEN_OFFSET + U32_SIZE;
 
+/// Sanity ceiling on a single key/value field length, independent of how
+/// many bytes are actually available in the buffer being decoded.
+///
+/// This exists to catch one specific, narrow failure mode: a corrupted
+/// `key_len`/`val_len` field whose value is implausibly large (e.g. a
+/// flipped high bit turning it into billions of bytes). Without this
+/// bound, such a field would make `decode()` report `TruncatedRecord`
+/// purely because the declared length exceeds the bytes remaining in the
+/// file — and `Wal::replay` treats `TruncatedRecord` as a forgivable
+/// crash tail, silently discarding it.
+///
+/// This bound is enforced symmetrically in both `encode()` and
+/// `decode()`, so Stone can never write a record that it would later
+/// refuse to read back as valid.
+///
+/// IMPORTANT — what this does NOT solve: a length field corrupted to a
+/// *moderate* value (e.g. `key_len` flipped from 3 to 1000, still well
+/// under this ceiling) that happens to exceed the bytes actually
+/// remaining in the file is indistinguishable from a genuine crash tail
+/// under this record format. The CRC lives at the end of the record, so
+/// there is no way to verify a record's integrity until all of its
+/// (possibly corrupted) declared length has already been consumed.
+/// Resolving that fully would require additional framing/integrity
+/// metadata — an on-disk format change — which is out of scope here.
+/// See `record::tests::moderate_length_corruption_is_still_indistinguishable_from_truncation`
+/// for a test that documents this honestly rather than claiming it's
+/// fixed.
+const MAX_FIELD_LEN: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     Set,
@@ -40,6 +69,13 @@ impl Record {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
+        if self.key.len() > MAX_FIELD_LEN {
+            return Err(StoneError::RecordTooLarge {
+                field: "key",
+                len: self.key.len(),
+            });
+        }
+
         let key_len = u32::try_from(self.key.len()).map_err(|_| StoneError::RecordTooLarge {
             field: "key",
             len: self.key.len(),
@@ -49,6 +85,13 @@ impl Record {
             Op::Set => &self.val,
             Op::Delete => &[],
         };
+
+        if value.len() > MAX_FIELD_LEN {
+            return Err(StoneError::RecordTooLarge {
+                field: "value",
+                len: value.len(),
+            });
+        }
 
         let val_len = u32::try_from(value.len()).map_err(|_| StoneError::RecordTooLarge {
             field: "value",
@@ -109,6 +152,15 @@ impl Record {
 
         let key_len = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
 
+        if key_len > MAX_FIELD_LEN {
+            return Err(StoneError::CorruptRecord {
+                reason: format!(
+                    "declared key length {} exceeds sanity bound {} — treating as corruption, not a crash tail",
+                    key_len, MAX_FIELD_LEN
+                ),
+            });
+        }
+
         let key_end =
             KEY_START_OFFSET
                 .checked_add(key_len)
@@ -136,6 +188,15 @@ impl Record {
             bytes[key_end + 2],
             bytes[key_end + 3],
         ]) as usize;
+
+        if val_len > MAX_FIELD_LEN {
+            return Err(StoneError::CorruptRecord {
+                reason: format!(
+                    "declared value length {} exceeds sanity bound {} — treating as corruption, not a crash tail",
+                    val_len, MAX_FIELD_LEN
+                ),
+            });
+        }
 
         let val_start = val_len_end;
 
@@ -283,6 +344,176 @@ mod tests {
         let result = Record::decode(&encoded);
 
         assert!(matches!(result, Err(StoneError::CorruptRecord { .. })));
+    }
+
+    #[test]
+    fn corrupted_key_len_field_is_rejected_as_corrupt_not_truncated() {
+        // Simulates a bit flip in the key_len field of an otherwise
+        // complete, well-formed record. Before the MAX_FIELD_LEN sanity
+        // bound, this was misclassified as TruncatedRecord (because the
+        // bogus declared length exceeds the bytes actually available),
+        // which caused Wal::replay to silently discard it as a forgivable
+        // crash tail. It must now be reported as CorruptRecord instead.
+        let record = Record::new_set(b"key".to_vec(), b"value".to_vec());
+        let mut encoded = record.encode().unwrap();
+
+        // key_len occupies bytes[1..5]; smash it to an implausibly large
+        // value while leaving every other byte (including the trailing
+        // CRC) untouched.
+        encoded[1] = 0xFF;
+        encoded[2] = 0xFF;
+        encoded[3] = 0xFF;
+        encoded[4] = 0x7F;
+
+        let result = Record::decode(&encoded);
+
+        assert!(
+            matches!(result, Err(StoneError::CorruptRecord { .. })),
+            "expected CorruptRecord for a corrupted key_len field, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn corrupted_val_len_field_is_rejected_as_corrupt_not_truncated() {
+        let record = Record::new_set(b"key".to_vec(), b"value".to_vec());
+        let mut encoded = record.encode().unwrap();
+
+        // val_len occupies the 4 bytes immediately after the key.
+        let val_len_offset = 1 + 4 + record.key.len();
+
+        encoded[val_len_offset] = 0xFF;
+        encoded[val_len_offset + 1] = 0xFF;
+        encoded[val_len_offset + 2] = 0xFF;
+        encoded[val_len_offset + 3] = 0x7F;
+
+        let result = Record::decode(&encoded);
+
+        assert!(
+            matches!(result, Err(StoneError::CorruptRecord { .. })),
+            "expected CorruptRecord for a corrupted val_len field, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn corrupted_key_len_in_a_record_followed_by_more_data_is_still_rejected() {
+        // This specifically exercises an implausibly large corrupted
+        // length (well past MAX_FIELD_LEN), which is what makes it
+        // reliably classifiable as corruption regardless of what follows
+        // it in the buffer. This is NOT a general proof that all
+        // non-final-record corruption is detectable — a moderate
+        // corrupted length that stays under MAX_FIELD_LEN is not caught
+        // by this mechanism; see
+        // moderate_length_corruption_is_still_indistinguishable_from_truncation.
+        let victim = Record::new_set(b"key".to_vec(), b"value".to_vec());
+        let mut encoded = victim.encode().unwrap();
+
+        encoded[1] = 0xFF;
+        encoded[2] = 0xFF;
+        encoded[3] = 0xFF;
+        encoded[4] = 0x7F;
+
+        let following = Record::new_set(b"next".to_vec(), b"record".to_vec());
+        let following_bytes = following.encode().unwrap();
+
+        let mut combined = encoded;
+        combined.extend_from_slice(&following_bytes);
+
+        let result = Record::decode(&combined);
+
+        assert!(
+            matches!(result, Err(StoneError::CorruptRecord { .. })),
+            "expected CorruptRecord even though valid data follows, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn key_at_max_field_len_boundary_is_accepted() {
+        let key = vec![b'k'; MAX_FIELD_LEN];
+        let record = Record::new_set(key.clone(), b"v".to_vec());
+
+        let encoded = record
+            .encode()
+            .expect("key at exactly MAX_FIELD_LEN must encode");
+
+        let (decoded, _) = Record::decode(&encoded).expect("must decode back");
+
+        assert_eq!(decoded.key, key);
+    }
+
+    #[test]
+    fn key_over_max_field_len_boundary_is_rejected_at_encode_time() {
+        let key = vec![b'k'; MAX_FIELD_LEN + 1];
+        let record = Record::new_set(key, b"v".to_vec());
+
+        let result = record.encode();
+
+        assert!(
+            matches!(result, Err(StoneError::RecordTooLarge { field: "key", .. })),
+            "expected RecordTooLarge for key one byte over the boundary, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn value_over_max_field_len_boundary_is_rejected_at_encode_time() {
+        let value = vec![b'v'; MAX_FIELD_LEN + 1];
+        let record = Record::new_set(b"k".to_vec(), value);
+
+        let result = record.encode();
+
+        assert!(
+            matches!(
+                result,
+                Err(StoneError::RecordTooLarge { field: "value", .. })
+            ),
+            "expected RecordTooLarge for value one byte over the boundary, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn moderate_length_corruption_is_still_indistinguishable_from_truncation() {
+        // This test documents a real, UNRESOLVED limitation rather than
+        // proving a fix. It must keep passing exactly as written — if it
+        // ever starts failing, that means decode() has changed in a way
+        // that silently narrowed (or widened) this known gap, and the
+        // comments on MAX_FIELD_LEN need to be revisited alongside it.
+        //
+        // MAX_FIELD_LEN only catches implausibly large corrupted lengths
+        // (see corrupted_key_len_field_is_rejected_as_corrupt_not_truncated).
+        // A length field corrupted to a moderate, still-plausible value
+        // that merely exceeds the bytes actually available is
+        // indistinguishable from a genuine interrupted-write crash tail
+        // under this record format, because the CRC that would catch the
+        // mismatch lives at the end of the record — past the point where
+        // decode() has already given up and reported TruncatedRecord.
+        let record = Record::new_set(b"key".to_vec(), b"value".to_vec());
+        let mut encoded = record.encode().unwrap();
+
+        // Original key_len is 3 (b"key"). Corrupt it to a moderate,
+        // plausible-looking value that is still far under MAX_FIELD_LEN,
+        // but larger than the bytes actually remaining in this buffer.
+        let corrupted_key_len: u32 = 1000;
+        let corrupted_bytes = corrupted_key_len.to_le_bytes();
+        encoded[1] = corrupted_bytes[0];
+        encoded[2] = corrupted_bytes[1];
+        encoded[3] = corrupted_bytes[2];
+        encoded[4] = corrupted_bytes[3];
+
+        let result = Record::decode(&encoded);
+
+        // This is the honest, current behavior — NOT the desired
+        // long-term behavior. It is reported as TruncatedRecord, meaning
+        // Wal::replay would (incorrectly, in the case of true corruption)
+        // treat this as a forgivable crash tail and discard it.
+        assert!(
+            matches!(result, Err(StoneError::TruncatedRecord { .. })),
+            "expected TruncatedRecord (documenting the known limitation), got {:?}",
+            result
+        );
     }
 
     #[test]
