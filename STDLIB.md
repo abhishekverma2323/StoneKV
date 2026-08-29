@@ -259,7 +259,7 @@ built exactly once on first access.
 
 **Why:** `LazyLock` was stabilized in Rust 1.80 specifically to cover
 this once_cell use case in std — using it directly avoids the
-dependency entirely. (Project is built and tested on Rust 1.97.1.)
+dependency entirely. (Project is built and tested with Rust 1.97.1 and Cargo 1.97.1.)
 
 **Tradeoff:** requires Rust ≥ 1.80; noted in README.md.
 

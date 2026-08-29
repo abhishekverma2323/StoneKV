@@ -2,6 +2,8 @@
 
 **A crash-safe embedded key-value store written in Rust with zero third-party dependencies.**
 
+**Hackathon Track:** D - Data & Storage
+
 `stone` is a small log-structured storage engine built using only the Rust standard library. It provides persistent `set`, `get`, and `delete` operations through both a command-line interface and an embeddable Rust API.
 
 The project focuses on durability, crash recovery, binary storage formats, sparse indexing, immutable segments, and full-store compaction without depending on external crates.
@@ -31,7 +33,7 @@ The project focuses on durability, crash recovery, binary storage formats, spars
 
 ## Requirements
 
-* Rust 1.98+ recommended
+* Tested with Rust 1.97.1
 * Cargo
 * No third-party Rust crates
 
