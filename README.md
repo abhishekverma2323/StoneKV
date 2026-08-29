@@ -1,21 +1,26 @@
-# stone
+# StoneKV
 
-**A crash-safe embedded key-value store written in Rust with zero third-party dependencies.**
+**A crash-safe embedded key-value store built in Rust with zero third-party dependencies.**
 
-**Hackathon Track:** D - Data & Storage
+**Zero Dependency Hackathon 2026 — Track D: Data & Storage**
 
-`stone` is a small log-structured storage engine built using only the Rust standard library. It provides persistent `set`, `get`, and `delete` operations through both a command-line interface and an embeddable Rust API.
+StoneKV is a small log-structured storage engine implemented entirely with the Rust standard library. It provides persistent `set`, `get`, and `delete` operations through both a command-line interface and an embeddable Rust API.
 
-The project focuses on durability, crash recovery, binary storage formats, sparse indexing, immutable segments, and full-store compaction without depending on external crates.
+Its goal is simple:
 
-## Features
+> **Build the core durable workflow of a real embedded key-value database without relying on external crates for storage, serialization, checksums, CLI parsing, error handling, or recovery.**
+
+---
+
+## Highlights
 
 * Persistent `SET`, `GET`, and `DELETE`
 * Write-ahead log (WAL)
-* `File::sync_all()` durability before acknowledging writes
-* Recovery from incomplete WAL crash tails
-* Physical removal of invalid WAL tails after recovery
-* Manual IEEE CRC32 integrity checks
+* `File::sync_all()` before acknowledging writes
+* Restart recovery from the WAL
+* Recovery from incomplete final WAL writes
+* Physical truncation of invalid crash tails
+* Hand-written IEEE CRC32 integrity checking
 * Sorted in-memory memtable using `BTreeMap`
 * Automatic memtable flushing
 * Immutable sorted segment files
@@ -23,21 +28,30 @@ The project focuses on durability, crash recovery, binary storage formats, spars
 * Newest-to-oldest reads
 * Tombstone-based deletes
 * Full-store compaction
-* Atomic temporary-file-to-segment installation
-* Monotonic segment generations
+* Crash-safe compaction recovery using `compaction.pending`
+* Synced temporary-file-to-segment installation
+* Monotonic segment generation numbers
 * Store statistics
 * Integrity verification command
 * CLI and embeddable Rust API
 * Single-process threaded access through `Arc<Mutex<Store>>`
-* Zero third-party runtime dependencies
+* **Zero third-party Rust dependencies**
+
+---
 
 ## Requirements
 
-* Tested with Rust 1.97.1
-* Cargo
+* **Minimum Rust version:** Rust 1.80+
+* **Validated environment:** `rustc 1.97.1` and `cargo 1.97.1`
 * No third-party Rust crates
 
+Rust 1.80+ is required because StoneKV uses `std::sync::LazyLock`.
+
+---
+
 ## Build
+
+StoneKV builds with one command:
 
 ```bash
 cargo build --release
@@ -45,76 +59,71 @@ cargo build --release
 
 The release binary is produced at:
 
-### Linux / macOS
-
-```text
-target/release/stone
-```
-
 ### Windows
 
 ```text
 target\release\stone.exe
 ```
 
-## Quick Start
-
-### Set a value
-
-```bash
-stone set hello world
-```
-
-Output:
+### Linux / macOS
 
 ```text
-OK
+target/release/stone
 ```
 
-### Get a value
+---
+
+# Judge Quick Check
+
+A reviewer can verify the core claims without reading the implementation.
+
+## 1. Verify zero dependencies
 
 ```bash
-stone get hello
+cargo tree -e normal
 ```
 
-Output:
+Expected dependency tree:
 
 ```text
-world
+stone v0.1.0 (...)
 ```
 
-### Delete a value
+There should be no third-party crates listed underneath StoneKV.
+
+`Cargo.toml` intentionally contains an empty dependency section:
+
+```toml
+[dependencies]
+```
+
+A generated Cargo metadata proof is also committed as [`deps-proof.txt`](deps-proof.txt).
+
+---
+
+## 2. Build
 
 ```bash
-stone del hello
+cargo build --release
 ```
 
-Output:
+---
 
-```text
-OK
+## 3. Inspect the CLI
+
+### Windows
+
+```powershell
+.\target\release\stone.exe help
 ```
 
-### Get a missing value
+### Linux / macOS
 
 ```bash
-stone get hello
+./target/release/stone help
 ```
 
-Output on stderr:
-
-```text
-not found
-```
-
-### Use a custom data directory
-
-```bash
-stone set user:1 Abhishek --dir ./my-data
-stone get user:1 --dir ./my-data
-```
-
-## Commands
+Available commands:
 
 ```text
 stone set <key> <value> [--dir PATH]
@@ -126,13 +135,150 @@ stone verify [--dir PATH]
 stone help
 ```
 
-The default storage directory is:
+---
 
-```text
-./stone-data
+## 4. Store and retrieve arbitrary data
+
+### Windows
+
+```powershell
+.\target\release\stone.exe set employee:42 "Rohan Sharma" --dir judge-data
+.\target\release\stone.exe get employee:42 --dir judge-data
 ```
 
-## Architecture
+### Linux / macOS
+
+```bash
+./target/release/stone set employee:42 "Rohan Sharma" --dir judge-data
+./target/release/stone get employee:42 --dir judge-data
+```
+
+Expected output:
+
+```text
+OK
+Rohan Sharma
+```
+
+---
+
+## 5. Verify the store
+
+### Windows
+
+```powershell
+.\target\release\stone.exe verify --dir judge-data
+```
+
+### Linux / macOS
+
+```bash
+./target/release/stone verify --dir judge-data
+```
+
+Successful verification starts with:
+
+```text
+OK
+```
+
+Using `--dir` lets reviewers create isolated stores without modifying the default `./stone-data` directory.
+
+---
+
+# Quick Start
+
+## Set a value
+
+### Windows
+
+```powershell
+.\target\release\stone.exe set user:1 Abhishek
+```
+
+### Linux / macOS
+
+```bash
+./target/release/stone set user:1 Abhishek
+```
+
+Output:
+
+```text
+OK
+```
+
+---
+
+## Get a value
+
+### Windows
+
+```powershell
+.\target\release\stone.exe get user:1
+```
+
+### Linux / macOS
+
+```bash
+./target/release/stone get user:1
+```
+
+Output:
+
+```text
+Abhishek
+```
+
+---
+
+## Overwrite a value
+
+```text
+SET user:1 = Abhishek
+SET user:1 = Rahul
+GET user:1
+```
+
+The newest value is authoritative:
+
+```text
+Rahul
+```
+
+---
+
+## Delete a value
+
+### Windows
+
+```powershell
+.\target\release\stone.exe del user:1
+```
+
+### Linux / macOS
+
+```bash
+./target/release/stone del user:1
+```
+
+Output:
+
+```text
+OK
+```
+
+Reading the deleted key returns:
+
+```text
+not found
+```
+
+A missing key is written to stderr and returns a non-zero exit status.
+
+---
+
+# Architecture
 
 ```text
                  CLI / Rust Library
@@ -142,58 +288,66 @@ The default storage directory is:
                      | Store |
                      +---+---+
                          |
-               +---------+---------+
-               |                   |
-               v                   v
-            +------+          +----------+
-            | WAL  |          | Memtable |
-            +------+          | BTreeMap |
-               |              +-----+----+
-           sync_all()               |
-                                    | threshold
-                                    v
-                           +----------------+
-                           | segment.tmp    |
-                           | sorted records |
-                           +-------+--------+
-                                   |
-                              flush + sync
-                                   |
-                                  rename
+                +--------+--------+
+                |                 |
+                v                 v
+             +------+        +----------+
+             | WAL  |        | Memtable |
+             +------+        | BTreeMap |
+                |            +-----+----+
+            sync_all()             |
+                                   | threshold
                                    v
-                           +----------------+
-                           | segment.seg    |
-                           | sparse index   |
-                           +-------+--------+
-                                   |
-                             full compaction
-                                   v
-                           +----------------+
-                           | merged segment |
-                           +----------------+
+                          +----------------+
+                          | segment.seg.tmp|
+                          | sorted records |
+                          +-------+--------+
+                                  |
+                             flush + sync
+                                  |
+                                rename
+                                  v
+                          +----------------+
+                          | segment.seg    |
+                          | sparse index   |
+                          +-------+--------+
+                                  |
+                           full compaction
+                                  v
+                          +----------------+
+                          | merged segment |
+                          +----------------+
 ```
 
-## Write Path
-
-Every `set` and `delete` follows:
+StoneKV uses a log-structured design:
 
 ```text
-Record
-   |
-   v
-append WAL
-   |
-   v
+WAL -> Memtable -> Immutable Segments -> Full Compaction
+```
+
+---
+
+# Write Path
+
+Every `set` and `delete` follows this ordering:
+
+```text
+construct record
+      |
+      v
+append to WAL
+      |
+      v
 File::sync_all()
-   |
-   v
+      |
+      v
 update memtable
-   |
-   v
+      |
+      v
 flush when threshold is reached
 ```
 
-Stone does not mutate the memtable until the WAL append and `sync_all()` succeed.
+StoneKV does **not** mutate the memtable until the WAL append and `sync_all()` succeed.
 
 Therefore, if:
 
@@ -201,33 +355,37 @@ Therefore, if:
 store.set(key, value)?;
 ```
 
-returns `Ok(())`, Stone has completed the WAL durability step for that operation.
+returns `Ok(())`, StoneKV has completed its WAL durability step for that operation.
 
-## Read Path
+---
+
+# Read Path
 
 ```text
 GET
  |
  +--> memtable
- |
- |    live value -> return
- |    tombstone  -> not found
- |    absent     -> continue
+ |      |
+ |      +--> live value -> return
+ |      +--> tombstone  -> not found
+ |      +--> absent     -> continue
  |
  +--> segments newest to oldest
-      |
-      live value -> return
-      tombstone  -> not found
-      absent     -> continue
+        |
+        +--> live value -> return
+        +--> tombstone  -> not found
+        +--> absent     -> continue
  |
  +--> not found
 ```
 
-The first value or tombstone found is authoritative.
+The first live value or tombstone encountered is authoritative.
 
-## Record Format
+---
 
-Records use a manually encoded binary representation:
+# Record Format
+
+StoneKV manually encodes records using an explicit binary format:
 
 ```text
 [op: u8]
@@ -251,13 +409,23 @@ A delete record contains:
 val_len = 0
 ```
 
-CRC32 covers every byte from `op` through the final value byte. The CRC field itself is not included.
+CRC32 covers every byte from `op` through the final value byte. The CRC field itself is excluded.
 
-All record length calculations use checked arithmetic before slicing data.
+All length arithmetic is checked before slicing input data.
 
-## CRC32
+StoneKV also applies a defensive field-size ceiling:
 
-Stone implements reflected IEEE CRC32 manually using:
+```text
+MAX_FIELD_LEN = 64 MiB
+```
+
+The same limit is enforced during both encoding and decoding so StoneKV never writes a record that it would later reject solely because of its field size.
+
+---
+
+# CRC32
+
+StoneKV implements reflected IEEE CRC32 manually.
 
 ```text
 Polynomial: 0xEDB88320
@@ -265,13 +433,13 @@ Initial:    0xFFFFFFFF
 Final XOR:  0xFFFFFFFF
 ```
 
-The lookup table is generated once using:
+The lookup table is initialized once using:
 
 ```rust
 std::sync::LazyLock
 ```
 
-No CRC or lazy-initialization crate is required.
+No checksum or lazy-initialization crate is required.
 
 The standard test vector is verified:
 
@@ -279,7 +447,9 @@ The standard test vector is verified:
 CRC32("123456789") = 0xCBF43926
 ```
 
-## Write-Ahead Log
+---
+
+# Write-Ahead Log
 
 The WAL is stored at:
 
@@ -297,11 +467,13 @@ write_all
 sync_all
 ```
 
-During startup Stone replays complete WAL records into the memtable.
+During startup StoneKV replays complete WAL records into a fresh memtable.
 
-### Crash-tail recovery
+---
 
-A process may terminate halfway through its final WAL write:
+## Crash-Tail Recovery
+
+A process may terminate while the final WAL record is still being written:
 
 ```text
 valid record
@@ -309,23 +481,34 @@ valid record
 partial record
 ```
 
-Stone distinguishes this from checksum corruption.
-
-For an incomplete final record Stone:
+For an incomplete final record StoneKV:
 
 1. Replays the valid prefix.
 2. Stops at the incomplete record.
-3. Physically truncates the WAL to the last valid byte.
+3. Truncates the WAL back to the last valid byte.
 4. Calls `sync_all()`.
 5. Continues startup.
 
-Physical truncation is important because otherwise future valid appends could remain unreachable behind the damaged bytes.
+Physical truncation is important.
 
-A complete record with an invalid checksum is treated as corruption and returns an error instead of being silently discarded.
+Without it:
 
-## Memtable
+```text
+valid
+valid
+broken tail
+NEW VALID WRITE
+```
 
-Unflushed state is stored in:
+would leave the newer valid write unreachable during the next replay.
+
+A complete record with a bad checksum or an invalid operation code is treated as corruption and causes StoneKV to fail loudly rather than silently removing it.
+
+---
+
+# Memtable
+
+Unflushed logical state is stored in:
 
 ```rust
 BTreeMap<Vec<u8>, Option<Vec<u8>>>
@@ -338,7 +521,7 @@ Some(value) -> live value
 None        -> tombstone
 ```
 
-`BTreeMap` keeps keys sorted automatically, which makes segment generation straightforward.
+`BTreeMap` automatically keeps keys sorted, which makes immutable segment generation straightforward.
 
 The default approximate flush threshold is:
 
@@ -346,9 +529,13 @@ The default approximate flush threshold is:
 4 MiB
 ```
 
-## Segment Files
+Once the threshold is crossed, the memtable is written into an immutable segment.
 
-Segments are immutable and generation ordered.
+---
+
+# Segment Files
+
+Segments are immutable and ordered using monotonic generation numbers.
 
 Example:
 
@@ -365,24 +552,26 @@ Temporary installation files use:
 segment_00000000000000000004.seg.tmp
 ```
 
-Wall-clock timestamps and UUIDs are not required.
+StoneKV does not require UUIDs or wall-clock timestamps for segment ordering.
 
-## Segment Format
+---
+
+# Segment Format
 
 ```text
 +-------------------------------+
 | MAGIC "STON"       4 bytes    |
 | VERSION            1 byte     |
 +-------------------------------+
-| Record 1                       |
-| Record 2                       |
-| ...                            |
-| Record N                       |
-+-------------------------------+  <- index_offset
+| Record 1                      |
+| Record 2                      |
+| ...                           |
+| Record N                      |
++-------------------------------+ <- index_offset
 | sparse index entries          |
 +-------------------------------+
-| index_offset        u64 LE     |
-| MAGIC "STON"        4 bytes    |
+| index_offset        u64 LE    |
+| MAGIC "STON"        4 bytes   |
 +-------------------------------+
 ```
 
@@ -398,11 +587,13 @@ Footer size:
 12 bytes
 ```
 
-Segment readers scan records only between byte `5` and `index_offset`.
+Segment readers decode records only between byte `5` and `index_offset`.
 
-Sparse-index data is never interpreted as record data.
+Sparse-index bytes are never interpreted as record data.
 
-## Sparse Index
+---
+
+# Sparse Index
 
 Every 16th record is indexed:
 
@@ -410,7 +601,7 @@ Every 16th record is indexed:
 0, 16, 32, 48, ...
 ```
 
-An index entry contains:
+Each sparse-index entry contains:
 
 ```text
 [key_len: u32 LE]
@@ -418,15 +609,19 @@ An index entry contains:
 [file_offset: u64 LE]
 ```
 
-The offset points to the beginning of an encoded record.
+The stored offset points to the beginning of an encoded record.
 
 The first record in every non-empty segment is always indexed.
 
-## Atomic Segment Installation
+For lookup, StoneKV finds the largest indexed key less than or equal to the target and begins scanning from that record.
 
-Memtable data is never written directly to its final segment filename.
+---
 
-Stone performs:
+# Atomic Segment Installation
+
+Memtable contents are never written directly to the final segment filename.
+
+StoneKV performs:
 
 ```text
 write segment.seg.tmp
@@ -447,29 +642,47 @@ truncate WAL
 clear memtable
 ```
 
-This ordering protects acknowledged WAL-backed writes from being lost during segment installation.
+This ordering prevents acknowledged WAL-backed writes from being lost during segment installation.
 
-If the process terminates before rename, the old WAL still contains the data.
+### Crash before rename
 
-If the process terminates after rename but before WAL truncation, both the segment and WAL may contain the newest state. Replaying that state again is logically harmless.
+```text
+WAL remains authoritative
+temporary segment is ignored
+```
 
-## Compaction
+### Crash after rename but before WAL truncation
 
-Stone intentionally implements **full compaction only**.
+```text
+durable segment exists
+WAL still exists
+```
 
-All segments are read:
+On restart the WAL may replay data that is already present in the newest segment. This duplication is logically harmless because the replayed memtable state shadows disk segments.
+
+---
+
+# Compaction
+
+StoneKV intentionally implements **full compaction only**.
+
+All existing segments are processed:
 
 ```text
 oldest -> newest
 ```
 
-and merged into a `BTreeMap`.
+into a logical:
 
-Newer entries overwrite older versions.
+```rust
+BTreeMap<Vec<u8>, Option<Vec<u8>>>
+```
 
-Because every old segment participates in full compaction, final tombstones can safely be removed rather than copied into the new segment.
+Newer entries overwrite older entries.
 
-Compaction performs:
+Because every old segment participates in the operation, final tombstones can safely be removed from the compacted output.
+
+Conceptually:
 
 ```text
 all old segments
@@ -484,83 +697,87 @@ new segment.tmp
 sync_all
        |
        v
-rename
+install final segment
        |
        v
-validate new segment
+validate replacement
        |
        v
-close old readers
-       |
-       v
-delete old segments
+remove replaced segments
 ```
 
-Old segments are never deleted before the replacement segment is written, synced, renamed, and successfully opened.
+StoneKV never intentionally removes old segment data before a valid replacement exists.
 
-### Compaction Crash Recovery
+---
 
-The compaction flow above has one more durability layer beyond what the diagram shows: a **transaction marker** that survives a crash occurring anywhere between "new segment installed" and "old segments deleted."
+# Compaction Crash Recovery
 
-This matters because full compaction deletes multiple old segment files one at a time, and a process crash partway through that deletion loop would otherwise leave the store in an ambiguous state — some old segments gone, some still present, with no record of what the compaction was even trying to do.
+Compaction contains an additional crash-recovery mechanism using:
 
-Stone closes that gap with `compaction.pending`, a small durable marker file written to the `segments/` directory:
+```text
+segments/compaction.pending
+```
+
+The marker records:
+
+* the generation being produced
+* the old generations being replaced
+
+The simplified transaction is:
 
 ```text
 build compacted segment.tmp
-       |
-       v
+        |
+        v
 sync_all
-       |
-       v
-write compaction.pending  <-- records: output generation,
-       |                        old generations being replaced
-       v
-rename segment.tmp -> final .seg
-       |
-       v
+        |
+        v
+write compaction.pending
+        |
+        v
+rename compacted segment into place
+        |
+        v
 validate final segment
-       |
-       v
-old segments deleted one by one
-       |
-       v
-delete compaction.pending
+        |
+        v
+delete replaced segments
+        |
+        v
+remove compaction.pending
 ```
 
-The marker is written **before** the compacted segment is renamed into place, and deleted **only after every replaced old segment has actually been removed**. That ordering means the marker's mere presence at startup is itself the signal that a compaction transaction was interrupted, and its contents (which generation was being produced, which old generations it was replacing) are exactly what's needed to finish or roll back that transaction correctly.
+If StoneKV restarts and discovers `compaction.pending`, it determines whether the interrupted transaction should be rolled back or completed.
 
-At `Store::open()`, before anything else loads, `recover_pending_compaction()` inspects `segments/` and resolves every case a crash could have left behind:
+Important cases include:
 
-| Crash point | What's on disk | Recovery action |
-|---|---|---|
-| Before the marker was written | No `compaction.pending` | Nothing to recover — old segments are untouched and still authoritative. |
-| After `compaction.pending.tmp` written, before rename to `compaction.pending` | Only the temp marker file | Temp marker is discarded as a leftover of a transaction that never actually became active. |
-| After the marker is active, before the final segment exists | `compaction.pending` + old segments, no new `.seg` | Rolled back: any stray `.tmp` segment is removed, the marker is removed, old segments remain authoritative. |
-| After the final segment is installed, before old segments are deleted | `compaction.pending` + new segment + some/all old segments | Rolled **forward**: the new segment is re-validated (opened and structurally checked), then any remaining old segments named in the marker are deleted, then the marker is removed. |
-| After every old segment is deleted, before the marker itself is removed | `compaction.pending` + new segment only | Marker is simply removed — cleanup was already complete. |
+| Crash state                                        | Recovery                                               |
+| -------------------------------------------------- | ------------------------------------------------------ |
+| Marker was never activated                         | Old segments remain authoritative                      |
+| Only temporary marker exists                       | Temporary marker is removed                            |
+| Marker exists but final compacted segment does not | Transaction rolls back                                 |
+| Marker and final compacted segment exist           | Replacement is revalidated, then cleanup rolls forward |
+| Old segments are already gone but marker remains   | Marker is removed                                      |
 
-The key design decision is that recovery always re-validates the new compacted segment (open + structural check) before trusting it and deleting anything else. If that validation fails, Stone does not delete the old segments — it fails loudly instead of destroying the only good copy of the data. This is why `compact()`'s in-process rollback logic and `recover_pending_compaction()`'s crash-time recovery logic follow the identical rule: **never delete data you haven't first confirmed has a valid replacement on disk.**
+The key invariant is:
 
-This is tested directly in `store::tests::interrupted_compaction_before_install_rolls_back` and `store::tests::interrupted_compaction_does_not_resurrect_deleted_key`, and is one of the places Stone's implementation goes beyond what a minimal full-compaction design strictly requires.
+> **Never delete data until its replacement has been written and successfully validated.**
 
-## Statistics
+This behavior is tested by the compaction recovery tests, including prevention of deleted-key resurrection.
+
+---
+
+# Statistics
+
+Run:
 
 ```bash
 stone stats
 ```
 
-Reports:
+or use the release binary directly.
 
-```text
-segments
-segment_bytes
-wal_bytes
-memtable_entries
-memtable_bytes
-```
-
-Example:
+Example output:
 
 ```text
 segments: 2
@@ -570,13 +787,25 @@ memtable_entries: 0
 memtable_bytes: 0
 ```
 
-## Verification
+Reported fields:
+
+```text
+segments
+segment_bytes
+wal_bytes
+memtable_entries
+memtable_bytes
+```
+
+---
+
+# Verification
+
+Run:
 
 ```bash
 stone verify
 ```
-
-Stone validates the current WAL and scans all segment records.
 
 Successful output resembles:
 
@@ -587,34 +816,36 @@ segments_checked: 2
 records_checked: 500
 ```
 
-Validation includes record CRC checks and segment structural checks.
+Verification checks:
 
-## Rust Library API
+* WAL record decoding
+* record CRC32 values
+* segment headers
+* segment footers
+* sparse-index structure
+* record boundaries
+* segment records
+
+---
+
+# Rust Library API
+
+StoneKV can also be embedded directly into a Rust program.
 
 ```rust
 use stone::Store;
 use std::path::Path;
 
 fn main() -> stone::Result<()> {
-    let mut store =
-        Store::open(Path::new("./stone-data"))?;
+    let mut store = Store::open(Path::new("./stone-data"))?;
 
     store.set(b"user:1", b"Abhishek")?;
 
-    let value =
-        store.get(b"user:1")?;
-
-    assert_eq!(
-        value,
-        Some(b"Abhishek".to_vec())
-    );
+    let value = store.get(b"user:1")?;
+    assert_eq!(value, Some(b"Abhishek".to_vec()));
 
     store.delete(b"user:1")?;
-
-    assert_eq!(
-        store.get(b"user:1")?,
-        None
-    );
+    assert_eq!(store.get(b"user:1")?, None);
 
     Ok(())
 }
@@ -631,11 +862,13 @@ StoneError
 Result
 ```
 
-## Concurrency Model
+---
+
+# Concurrency Model
 
 `Store` does not perform internal concurrent mutation.
 
-Multiple threads inside one process can coordinate access using:
+Multiple threads within one process can coordinate access using:
 
 ```rust
 Arc<Mutex<Store>>
@@ -643,19 +876,25 @@ Arc<Mutex<Store>>
 
 with standard-library synchronization primitives.
 
-Stone does **not** implement multi-process file locking.
+StoneKV does **not** implement multi-process writer locking.
 
 Two independent processes writing to the same store directory concurrently are unsupported.
 
-## Durability Claim
+---
 
-Stone's durability claim is intentionally narrow:
+# Durability Claim
 
-> After `Store::set()` or `Store::delete()` returns `Ok`, the operation has been appended to the WAL and `File::sync_all()` has completed. On restart, Stone replays valid WAL records. If the process terminated during the final record append, Stone discards and physically truncates only that incomplete tail. Segment installation uses a synced temporary file followed by rename before the WAL is discarded.
+StoneKV's durability claim is intentionally narrow:
 
-Stone relies on Rust `File::sync_all()` and same-filesystem rename semantics.
+> After `Store::set()` or `Store::delete()` returns `Ok(())`, the operation has been appended to the WAL and `File::sync_all()` has completed. On restart, StoneKV replays valid WAL records. If the process terminated during the final record append, StoneKV discards and physically truncates the incomplete tail. Segment installation uses a synced temporary file followed by rename before the WAL is discarded.
 
-## Tests
+StoneKV relies on Rust `File::sync_all()` and same-filesystem rename semantics.
+
+It does not claim protection against every possible filesystem, storage controller, power-loss, disk-full, or malicious-corruption scenario.
+
+---
+
+# Tests
 
 Run:
 
@@ -663,41 +902,65 @@ Run:
 cargo test
 ```
 
-The current implementation includes unit and integration coverage for:
+The validated suite contains:
+
+```text
+89 unit tests
+28 integration tests
+--------------------
+117 total tests
+```
+
+Coverage includes:
 
 * CRC32
-* binary record encoding
-* truncation handling
+* record encoding and decoding
+* empty keys and values
+* malformed operation bytes
+* truncation boundaries
+* field-size limits
 * checksum corruption
-* WAL append/replay
-* physical crash-tail truncation
-* memtable behavior
-* segment headers and footers
-* sparse-index lookups
-* segment CRC corruption
-* store reopen/recovery
-* tombstones
-* generation ordering
+* length-field corruption hardening
+* WAL append and replay
+* physical WAL crash-tail truncation
+* writes after recovery
+* memtable replacement and tombstones
 * automatic flush
+* segment headers and footers
+* sparse-index boundaries
+* segment CRC corruption
+* store reopen and recovery
+* generation ordering
+* newest-value semantics
 * full compaction
 * deleted-key resurrection prevention
+* interrupted compaction recovery
 * threaded single-process access
 
-The current validated suite contains more than one hundred passing tests.
+The current validated result is:
 
-## Benchmark
+```text
+117 passed
+0 failed
+```
 
-Stone contains a zero-dependency benchmark harness:
+---
+
+# Benchmark
+
+StoneKV includes a zero-dependency benchmark harness:
 
 ```bash
 cargo bench
 ```
 
-It uses only:
+It uses:
 
 ```rust
 std::time::Instant
 ```
+
+rather than an external benchmarking framework.
 
 The harness measures:
 
@@ -707,38 +970,70 @@ The harness measures:
 * verification time
 * full compaction
 
-Write throughput should be interpreted carefully because every acknowledged write performs `File::sync_all()`.
+Write throughput should be interpreted carefully because each acknowledged write performs `File::sync_all()`.
 
-Do not compare these numbers directly with databases configured for asynchronous or batched durability.
+Numbers are intentionally not hard-coded into this README because results depend heavily on the operating system, filesystem, storage device, and durability semantics.
 
-Benchmark results are intentionally not hard-coded in this README because performance varies significantly by operating system, filesystem, storage hardware, and durability semantics.
+---
 
-## Zero Dependency Proof
+# Zero-Dependency Proof
 
-`Cargo.toml` intentionally contains:
+`Cargo.toml` contains:
 
 ```toml
 [dependencies]
-# intentionally empty — zero third-party runtime dependencies
+# intentionally empty - zero third-party runtime dependencies
 ```
 
-Verify it with:
+Verify the normal dependency tree:
 
 ```bash
 cargo tree -e normal
 ```
 
-Generate metadata proof using:
+Expected:
 
-```bash
-cargo metadata --format-version 1 --no-deps > deps-proof.txt
+```text
+stone v0.1.0 (...)
 ```
 
-See [`STDLIB.md`](STDLIB.md) for the standard-library substitutions used by Stone.
+with no third-party crates underneath.
 
-## Honest Limitations
+Generate Cargo metadata using:
 
-Stone currently does not provide:
+```bash
+cargo metadata --format-version 1 --no-deps
+```
+
+A generated proof is committed as:
+
+[`deps-proof.txt`](deps-proof.txt)
+
+See [`STDLIB.md`](STDLIB.md) for the standard-library substitutions used throughout StoneKV.
+
+Examples include replacements for functionality commonly provided by:
+
+* `serde`
+* `bincode`
+* `crc32fast`
+* `once_cell`
+* `clap`
+* `thiserror`
+* `anyhow`
+* `log`
+* `tracing`
+* `tempfile`
+* `uuid`
+* external database engines
+* external benchmark frameworks
+
+StoneKV implements these needs using Rust's standard library and project-specific code.
+
+---
+
+# Honest Limitations
+
+StoneKV intentionally does not provide:
 
 * networking
 * SQL
@@ -756,15 +1051,25 @@ Stone currently does not provide:
 * GUI or TUI
 * protection against malicious file modification
 * guarantees under arbitrary disk corruption
-* tested guarantees for every network filesystem
-* explicit disk-full handling
-* power-controller fault testing
+* guarantees for every network filesystem
+* explicit disk-full recovery
+* storage-controller or power-loss fault testing
 
-Stone prioritizes a small, explainable, durable core rather than feature breadth.
+StoneKV prioritizes a small, explainable, durable core over feature breadth.
 
-**On length-field corruption specifically:** Stone rejects a `key_len`/`val_len` field corrupted to an implausibly large value (see `MAX_FIELD_LEN` in `record.rs`) as corruption rather than silently discarding it as a crash tail. It does **not** fully solve the general problem — a length field corrupted to a moderate, still-plausible value that happens to exceed the bytes actually remaining is indistinguishable from a genuine interrupted write under this record format, since the CRC that would catch the mismatch lives at the end of the record. Fully closing this would require additional framing/integrity metadata (an on-disk format change), which is out of scope here. This is documented and intentionally left as a known, tested limitation rather than an unexamined gap — see `record::tests::moderate_length_corruption_is_still_indistinguishable_from_truncation`.
+## Length-field corruption
 
-## Project Structure
+StoneKV rejects implausibly large corrupted `key_len` or `val_len` values using its `MAX_FIELD_LEN` validation.
+
+However, the current record format cannot perfectly distinguish every moderate length-field corruption from a genuinely interrupted final append because the CRC that would disambiguate the record is located at its end.
+
+Completely eliminating that ambiguity would require additional framing or integrity metadata and therefore an on-disk format change.
+
+For the hackathon version this behavior is explicitly documented and tested rather than hidden or overclaimed.
+
+---
+
+# Project Structure
 
 ```text
 StoneKV/
@@ -809,7 +1114,11 @@ StoneKV/
     └── link.txt
 ```
 
-## Design Principle
+---
+
+# Design Principle
+
+StoneKV is intentionally optimized for correctness and explainability rather than feature count.
 
 ```text
 write acknowledged
@@ -833,4 +1142,4 @@ compaction preserves logical state
 zero third-party dependencies
 ```
 
-Correctness, durability, and explainability are the product.
+**Correctness, durability, and explainability are the product.**

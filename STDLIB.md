@@ -1,272 +1,759 @@
-# STDLIB.md
+# Standard-Library Substitution Log
 
-StoneKV is built entirely on the Rust standard library. No third-party
-runtime dependency appears anywhere in `Cargo.toml`, and none is required
-to build, test, or run the project.
+StoneKV is built entirely with the Rust standard library and project-specific code.
 
-This document lists every substitution actually present in the shipped
-code — not an aspirational list. Each entry names the crate normally
-reached for, what StoneKV uses instead, why the substitution was needed,
-how it is implemented, and the tradeoff accepted.
+**Third-party Rust dependencies: 0**
+
+This document lists the substitutions that are actually present in the submitted implementation. It is not an aspirational list.
+
+For each substitution, this log identifies:
+
+* what third-party crate or external facility would commonly be used
+* what StoneKV uses instead
+* where the implementation lives
+* why the substitution was made
+* the tradeoff accepted
+
+**Minimum Rust version:** Rust 1.80+
+**Validated environment:** `rustc 1.97.1` and `cargo 1.97.1`
 
 ---
 
-## 1. `serde` / `bincode` → manual binary encoding
+# At a Glance
+
+|  # | Common external choice         | StoneKV replacement                         |
+| -: | ------------------------------ | ------------------------------------------- |
+|  1 | `serde` / `bincode`            | Manual binary record encoding               |
+|  2 | `crc32fast`                    | Hand-written IEEE CRC32                     |
+|  3 | WAL library                    | Custom append/replay/truncate WAL           |
+|  4 | `sled` / `rocksdb`             | Custom log-structured storage engine        |
+|  5 | Ordered-map/index helper       | `std::collections::BTreeMap`                |
+|  6 | `clap`                         | `std::env::args()`                          |
+|  7 | `thiserror` / `anyhow`         | Hand-written `StoneError`                   |
+|  8 | `log` / `tracing`              | Small stderr logger                         |
+|  9 | `parking_lot`                  | `std::sync::{Arc, Mutex}`                   |
+| 10 | `tempfile`                     | Explicit `.tmp` files + `std::fs::rename()` |
+| 11 | `uuid`                         | Monotonic segment generations               |
+| 12 | Criterion                      | `std::time::Instant` benchmark harness      |
+| 13 | Assertion/property-test crates | Built-in `#[test]` and assertions           |
+| 14 | `once_cell`                    | `std::sync::LazyLock`                       |
+
+**Total: 14 genuine substitutions.**
+
+---
+
+# 1. `serde` / `bincode` → Manual Binary Encoding
 
 **File:** `src/record.rs`
 
-Records are encoded by hand as a fixed little-endian byte layout
-(`op`, `key_len`, `key`, `val_len`, `val`, `crc32`) using
-`to_le_bytes()` / `from_le_bytes()` directly, with `checked_add` used
-throughout offset arithmetic to reject overflow rather than panic.
+StoneKV manually encodes every database record into a documented little-endian binary layout:
 
-**Why:** serde's derive macros and bincode's wire format are exactly the
-kind of "glue" dependency the event asks teams to remove. A KV store's
-on-disk format also benefits from being explicit and human-auditable
-rather than opaque.
+```text
+[op: u8]
+[key_len: u32 LE]
+[key bytes]
+[val_len: u32 LE]
+[value bytes]
+[crc32: u32 LE]
+```
 
-**Tradeoff:** more boilerplate per field, and adding a new field means
-manually updating the encode/decode pair and bumping the format version
-— serde would do this automatically via derive.
+Encoding and decoding use standard-library operations such as:
+
+```rust
+u32::to_le_bytes()
+u32::from_le_bytes()
+```
+
+Offset and length calculations use checked arithmetic before slicing input data.
+
+StoneKV also enforces the same defensive field-size ceiling during both encoding and decoding:
+
+```text
+MAX_FIELD_LEN = 64 MiB
+```
+
+This ensures the encoder does not create a field that the decoder would reject solely because of its size.
+
+**Why**
+
+`serde` and `bincode` would normally remove much of the serialization boilerplate, but the on-disk representation is a core part of a storage engine.
+
+Implementing it directly makes the format:
+
+* explicit
+* deterministic
+* auditable
+* versionable
+* independent of an external serialization format
+
+**Tradeoff**
+
+Adding or changing record fields requires manually updating both encoding and decoding logic and may require an on-disk format-version change.
 
 ---
 
-## 2. `crc32fast` → handwritten IEEE CRC-32
+# 2. `crc32fast` → Hand-Written IEEE CRC32
 
 **File:** `src/crc32.rs`
 
-A standard 256-entry CRC-32 lookup table (polynomial `0xEDB88320`) is
-built once at first use via `std::sync::LazyLock` and reused for every
-checksum call. Verified against the canonical IEEE test vector
-(`checksum(b"123456789") == 0xCBF43926`).
+StoneKV implements reflected IEEE CRC32 directly.
 
-**Why:** every record and every segment footer needs a checksum to
-detect corruption; `crc32fast` is one of the most common
-"just install it" dependencies in this exact use case.
+```text
+Polynomial: 0xEDB88320
+Initial:    0xFFFFFFFF
+Final XOR:  0xFFFFFFFF
+```
 
-**Tradeoff:** no runtime CPU feature detection (SIMD/hardware CRC
-instructions), so raw throughput is lower on very large inputs. Correctness
-is unaffected — only raw speed.
+A 256-entry lookup table is generated once and stored using:
+
+```rust
+std::sync::LazyLock
+```
+
+The implementation is checked against the standard test vector:
+
+```text
+CRC32("123456789") = 0xCBF43926
+```
+
+**Why**
+
+Every encoded record needs an integrity check. A crate such as `crc32fast` would normally provide this functionality immediately, but checksum generation is small enough to implement directly and is central to StoneKV's corruption-detection story.
+
+**Tradeoff**
+
+The implementation does not use runtime CPU-feature detection or specialized SIMD/hardware acceleration.
+
+Correctness is preserved, but raw checksum throughput may be lower than a highly optimized CRC crate.
 
 ---
 
-## 3. WAL crate → custom append/replay/truncate log
+# 3. WAL Library → Custom Append / Replay / Recovery Log
 
 **File:** `src/wal.rs`
 
-A minimal write-ahead log implemented directly over `std::fs::File`:
-sequential `Record`-encoded appends, `sync_all()` after every append,
-a replay routine that reconstructs a memtable on startup, and a
-truncate routine that physically shortens the file after a successful
-flush.
+StoneKV implements its write-ahead log directly on top of:
 
-**Why:** WAL correctness (fsync ordering, partial-write detection,
-tail truncation) is the actual subject of the hackathon track, so this
-is core engineering, not something to delegate to a library.
+```rust
+std::fs::File
+```
 
-**Tradeoff:** no group-commit / batched fsync optimization — every
-write pays one `sync_all()` call.
+A successful append performs:
 
----
+```text
+encode record
+     |
+     v
+write_all()
+     |
+     v
+sync_all()
+```
 
-## 4. `sled` / RocksDB bindings → custom log-structured storage engine
+The WAL implementation also handles:
 
-**Files:** `src/store.rs`, `src/segment.rs`, `src/compaction.rs`,
-`src/memtable.rs`
+* sequential appends
+* startup replay
+* memtable reconstruction
+* incomplete final-record detection
+* physical crash-tail truncation
+* WAL truncation after successful segment installation
+* continued writes after recovery
 
-The full read/write/flush/compact lifecycle (WAL → memtable →
-immutable sorted segment → sparse index → full compaction) is
-implemented from scratch.
+**Why**
 
-**Why:** this is the project itself — the whole point of Track D is to
-reimplement what an embedded KV engine normally delegates to a
-library.
+WAL behavior is one of the central engineering problems of a durable storage engine.
 
-**Tradeoff:** no leveled compaction, no bloom filters, no block
-compression — deliberately out of scope for a 72-hour build (see
-"Honest limits" in README.md).
+Delegating append ordering, synchronization, replay, and crash-tail handling to an external log library would hide much of the work StoneKV is intended to demonstrate.
 
----
+**Tradeoff**
 
-## 5. Indexing helper → `std::collections::BTreeMap`
+StoneKV does not implement group commit or batched durability.
 
-**File:** `src/compaction.rs`
-
-Full compaction merges every segment into a `BTreeMap<Vec<u8>,
-Option<Vec<u8>>>` (newer segments overwrite older entries), then
-writes the map back out in sorted order.
-
-**Why:** compaction needs sorted, deduplicated key ordering; std's
-`BTreeMap` provides exactly that without an external indexing crate.
-
-**Tradeoff:** the entire logical dataset is materialized in memory
-during compaction — acceptable for the hackathon's dataset sizes, not
-appropriate for very large stores (documented in README.md).
+Every acknowledged write currently pays for its own `sync_all()` operation.
 
 ---
 
-## 6. `clap` → `std::env::args()`
+# 4. `sled` / `rocksdb` → Custom Log-Structured Storage Engine
+
+**Files:**
+
+```text
+src/store.rs
+src/segment.rs
+src/compaction.rs
+src/memtable.rs
+src/wal.rs
+```
+
+StoneKV implements its complete storage lifecycle itself:
+
+```text
+WAL
+ |
+ v
+BTreeMap memtable
+ |
+ v
+immutable sorted segments
+ |
+ v
+sparse indexes
+ |
+ v
+full compaction
+```
+
+The project implements:
+
+* write durability
+* restart recovery
+* in-memory state
+* immutable segment creation
+* sparse lookup indexes
+* generation ordering
+* tombstones
+* newest-value resolution
+* full compaction
+* compaction crash recovery
+
+**Why**
+
+Using an existing embedded database would remove the central engineering challenge of Track D.
+
+The storage engine itself is the project.
+
+**Tradeoff**
+
+StoneKV intentionally does not implement advanced database features such as:
+
+* leveled compaction
+* bloom filters
+* block compression
+* snapshots
+* transactions
+* replication
+
+These limitations are documented in `README.md`.
+
+---
+
+# 5. Ordered-Map / Index Helper → `std::collections::BTreeMap`
+
+**Files:**
+
+```text
+src/memtable.rs
+src/compaction.rs
+```
+
+StoneKV uses:
+
+```rust
+std::collections::BTreeMap
+```
+
+for sorted in-memory state and compaction merging.
+
+The memtable representation is:
+
+```rust
+BTreeMap<Vec<u8>, Option<Vec<u8>>>
+```
+
+where:
+
+```text
+Some(value) -> live value
+None        -> tombstone
+```
+
+During full compaction, older segment entries are applied before newer entries so later versions replace earlier ones.
+
+The final map can then be written directly in sorted key order.
+
+**Why**
+
+StoneKV needs deterministic ordered keys for segment creation and compaction.
+
+`BTreeMap` already provides exactly that functionality in the standard library.
+
+**Tradeoff**
+
+Full compaction materializes the logical dataset in memory.
+
+That approach is appropriate for the hackathon scope but is not intended for arbitrarily large production databases.
+
+---
+
+# 6. `clap` → `std::env::args()`
 
 **File:** `src/main.rs`
 
-CLI parsing is a small hand-written dispatcher over
-`std::env::args().skip(1)`, with `std::process::exit()` used for
-explicit exit codes (1 on any user-facing error, per spec).
+StoneKV's CLI parser is a small hand-written dispatcher built on:
 
-**Why:** clap is a very common "obvious" dependency for even a
-five-command CLI; a manual dispatcher this small doesn't need it.
+```rust
+std::env::args()
+```
 
-**Tradeoff:** no auto-generated `--help` formatting, no flag
-validation beyond what's hand-coded — acceptable at this command
-count.
+Supported commands are:
+
+```text
+stone set <key> <value> [--dir PATH]
+stone get <key> [--dir PATH]
+stone del <key> [--dir PATH]
+stone compact [--dir PATH]
+stone stats [--dir PATH]
+stone verify [--dir PATH]
+stone help
+```
+
+User-facing failures return an explicit non-zero process exit status.
+
+**Why**
+
+`clap` is a common default for Rust CLI applications, but StoneKV has a small command surface that does not require a large parsing framework.
+
+**Tradeoff**
+
+StoneKV does not receive:
+
+* generated CLI schemas
+* derive-based command definitions
+* automatic completion generation
+* sophisticated flag validation
+
+The necessary validation is implemented manually.
 
 ---
 
-## 7. `thiserror` / `anyhow` → handwritten `StoneError`
+# 7. `thiserror` / `anyhow` → Hand-Written `StoneError`
 
 **File:** `src/error.rs`
 
-A single `enum StoneError` with a manual `impl fmt::Display` and
-`impl std::error::Error`, plus a `From<std::io::Error>` conversion so
-`?` composes cleanly through I/O-heavy code.
+StoneKV defines its own error type:
 
-**Why:** thiserror/anyhow are near-default choices for Rust error
-handling; a fixed, small error surface doesn't need the macro
-machinery.
+```rust
+enum StoneError
+```
 
-**Tradeoff:** every new error variant requires a manual `Display` arm
-— thiserror would generate this from an attribute.
+with manual implementations of:
+
+```rust
+std::fmt::Display
+std::error::Error
+From<std::io::Error>
+```
+
+The conversion from `std::io::Error` allows idiomatic propagation with:
+
+```rust
+?
+```
+
+through I/O-heavy code.
+
+**Why**
+
+`thiserror` and `anyhow` are common choices for ergonomic Rust error handling, but StoneKV has a relatively small and controlled error surface.
+
+**Tradeoff**
+
+Every new error variant requires explicitly updating its display behavior and any relevant conversions.
+
+No derive macros generate that code automatically.
 
 ---
 
-## 8. `log` / `tracing` → a ~20-line stderr logger
+# 8. `log` / `tracing` → Small stderr Logger
 
 **File:** `src/logger.rs`
 
-`Level::{Info, Warn, Error}` with `log()`/`info()`/`warn()`/`error()`
-helpers, formatted as `[INFO]`/`[WARN]`/`[ERROR]` and written to
-stderr. No timestamps, by design — this keeps CLI output deterministic
-for tests and demos.
+StoneKV implements a minimal logger with levels such as:
 
-**Why:** log/tracing's subscriber/formatter model is significant
-machinery for a CLI tool that only needs a handful of diagnostic
-lines.
+```text
+INFO
+WARN
+ERROR
+```
 
-**Tradeoff:** no log levels filtering, no structured fields, no
-external sinks.
+and output such as:
+
+```text
+[INFO] flushed memtable to segment generation 2
+[WARN] truncated WAL tail detected: removing 11 invalid byte(s)
+```
+
+Diagnostics are written to stderr.
+
+Timestamps are intentionally omitted.
+
+**Why**
+
+A complete `log` or `tracing` ecosystem would add substantial machinery for a command-line storage engine that only needs a small number of deterministic diagnostic messages.
+
+**Tradeoff**
+
+The logger does not provide:
+
+* dynamic level filtering
+* structured fields
+* spans
+* subscriber configuration
+* external log sinks
+* timestamp formatting
 
 ---
 
-## 9. `parking_lot` → `std::sync::{Arc, Mutex}`
+# 9. `parking_lot` → `std::sync::{Arc, Mutex}`
 
 **File:** `tests/concurrent_access.rs`
 
-Multi-threaded access to a single `Store` is demonstrated by wrapping
-it in `Arc<Mutex<Store>>` and driving it from several `std::thread`
-workers writing disjoint keys, then verifying every key after `join`
-and after a reopen.
+StoneKV intentionally uses a coarse single-process synchronization model.
 
-**Why:** std's `Mutex` is sufficient for the coarse, single-lock
-concurrency model StoneKV intentionally uses (see "Concurrency model"
-in README.md); parking_lot's speed advantages target much
-higher-contention workloads than this project has.
+Multiple threads can share one `Store` using:
 
-**Tradeoff:** std's `Mutex` is marginally slower under heavy
-contention and has no fairness guarantees — irrelevant at StoneKV's
-intended scale.
+```rust
+Arc<Mutex<Store>>
+```
 
----
+The integration test starts multiple `std::thread` workers, writes disjoint keys, joins them, verifies the values, reopens the database, and verifies persistence again.
 
-## 10. `tempfile` → explicit `.tmp` file + `rename`
+**Why**
 
-**Files:** `src/store.rs`, `src/compaction.rs`
+The standard-library mutex is sufficient for the concurrency guarantees StoneKV intentionally provides.
 
-Every atomic install (segment flush, compaction output, the
-compaction transaction marker) is written to an explicit
-`*.tmp` path, `sync_all()`'d, then moved into place with
-`std::fs::rename()`. Startup scans for and discards stale `.tmp`
-files left behind by a crash mid-write.
+An external synchronization crate is unnecessary for this scale and design.
 
-**Why:** the atomic-rename pattern is simple enough to hand-write, and
-doing so makes the crash-safety story auditable in the code itself
-rather than hidden inside a dependency.
+**Tradeoff**
 
-**Tradeoff:** no automatic cleanup-on-drop semantics that `tempfile`
-provides — StoneKV relies on explicit startup-time sweeping instead.
+The design uses coarse locking rather than fine-grained internal database concurrency.
+
+StoneKV also intentionally does not support multiple independent processes writing to the same store directory concurrently.
 
 ---
 
-## 11. `uuid` → monotonic segment generations
+# 10. `tempfile` → Explicit `.tmp` Files + `rename`
+
+**Files:**
+
+```text
+src/store.rs
+src/compaction.rs
+```
+
+Crash-sensitive file installation uses explicit temporary paths.
+
+Examples include:
+
+```text
+segment_00000000000000000004.seg.tmp
+compaction.pending.tmp
+```
+
+The basic installation pattern is:
+
+```text
+write temporary file
+        |
+        v
+flush
+        |
+        v
+sync_all()
+        |
+        v
+rename into final location
+```
+
+Startup and recovery logic handle temporary files that can remain after interrupted operations.
+
+**Why**
+
+The temporary-file + atomic-rename pattern is small enough to implement directly.
+
+Doing so also makes StoneKV's crash-safety ordering visible and auditable rather than hiding it behind a helper crate.
+
+**Tradeoff**
+
+StoneKV does not receive automatic cleanup-on-drop behavior.
+
+Temporary-file lifecycle and crash cleanup must therefore be implemented explicitly.
+
+---
+
+# 11. `uuid` → Monotonic Segment Generations
 
 **File:** `src/store.rs`
 
-Segments are named `segment_{generation:020}.seg` using a
-zero-padded `u64` generation counter reconstructed at `Store::open()`
-by scanning existing files and taking `max_generation + 1`.
+Segments use deterministic generation-based names:
 
-**Why:** generation numbers are sortable, deterministic, and require
-no randomness source — a real advantage over UUIDs for this use case,
-not just a workaround.
+```text
+segment_00000000000000000001.seg
+segment_00000000000000000002.seg
+segment_00000000000000000003.seg
+```
 
-**Tradeoff:** none functionally; this is a strict improvement over
-UUID naming for an ordered, single-writer log structure.
+Generation numbers are represented as `u64` values and formatted with zero padding.
+
+At startup StoneKV scans existing segment filenames and determines the next generation from the highest generation already present.
+
+**Why**
+
+A segment identifier must primarily provide ordering, not global uniqueness.
+
+Monotonic generations are:
+
+* sortable
+* deterministic
+* easy to inspect
+* easy to compare
+* available without randomness
+
+**Tradeoff**
+
+Generation numbers are local to a StoneKV store directory rather than globally unique.
+
+That is appropriate for StoneKV's documented single-writer storage model.
 
 ---
 
-## 12. Benchmark crate (Criterion) → `std::time::Instant`
+# 12. Criterion → `std::time::Instant`
 
 **File:** `benches/throughput.rs`
 
-Sequential write/read throughput, reopen time, and compaction duration
-are timed with plain `Instant::now()` / `elapsed()` calls around each
-phase.
+StoneKV includes a zero-dependency benchmark harness implemented with:
 
-**Why:** Criterion's statistical rigor (warm-up iterations, outlier
-detection) is overkill for a rough throughput sanity check; a simple
-`Instant`-based harness is transparent about exactly what it measures.
+```rust
+std::time::Instant
+```
 
-**Tradeoff:** no statistical confidence intervals, no automatic
-warm-up — numbers are single-run and should be read as approximate.
+and:
+
+```rust
+Instant::now()
+elapsed()
+```
+
+The harness measures operations such as:
+
+* durable sequential writes
+* reads
+* reopen time
+* verification time
+* full compaction
+
+**Why**
+
+Criterion provides statistical benchmarking features that are useful for serious performance analysis, but StoneKV only needs a transparent sanity-check benchmark for the hackathon.
+
+**Tradeoff**
+
+The benchmark does not provide:
+
+* confidence intervals
+* automatic warm-up
+* statistical outlier detection
+* regression analysis
+
+Results should therefore be treated as approximate and environment-dependent.
 
 ---
 
-## 13. Assertion/test crates → built-in `#[test]`
+# 13. Assertion / Test Crates → Built-In `#[test]`
 
-**Files:** all of `src/*.rs` (`#[cfg(test)] mod tests`) and
-`tests/*.rs`
+**Files:**
 
-117 tests total: 89 unit tests colocated with their modules, plus 28
-integration tests across `roundtrip.rs`, `crash_recovery.rs`,
-`segment_roundtrip.rs`, `concurrent_access.rs`, and
-`compaction_correctness.rs`.
+```text
+src/*.rs
+tests/*.rs
+```
 
-**Why:** std's `#[test]` and `assert_eq!`/`assert!` are sufficient for
-this project's testing needs without pulling in `proptest`,
-`pretty_assertions`, or similar.
+StoneKV uses Rust's built-in testing facilities:
 
-**Tradeoff:** no property-based testing and no colorized/diffed
-assertion output — acceptable given the deterministic, byte-level
-nature of what's being tested.
+```rust
+#[test]
+assert!()
+assert_eq!()
+```
+
+The current validated test suite contains:
+
+```text
+89 unit tests
+28 integration tests
+--------------------
+117 total tests
+```
+
+Integration coverage is distributed across:
+
+```text
+tests/roundtrip.rs
+tests/crash_recovery.rs
+tests/segment_roundtrip.rs
+tests/concurrent_access.rs
+tests/compaction_correctness.rs
+```
+
+Coverage includes:
+
+* CRC32
+* record encoding and decoding
+* field-size boundaries
+* truncation handling
+* checksum corruption
+* WAL replay
+* physical crash-tail recovery
+* segment structure
+* sparse indexing
+* restart persistence
+* automatic flush
+* tombstones
+* compaction
+* compaction crash recovery
+* deleted-key resurrection prevention
+* threaded single-process access
+
+**Why**
+
+Rust's built-in test framework is sufficient for the deterministic byte-level and state-transition tests used by StoneKV.
+
+**Tradeoff**
+
+StoneKV does not currently use features from libraries such as:
+
+* `proptest`
+* `quickcheck`
+* `pretty_assertions`
+
+so there is no automatic property-based generation or enhanced assertion diff formatting.
 
 ---
 
-## 14. `once_cell` → `std::sync::LazyLock`
+# 14. `once_cell` → `std::sync::LazyLock`
 
 **File:** `src/crc32.rs`
 
-The CRC-32 lookup table is a `static TABLE: LazyLock<[u32; 256]>`,
-built exactly once on first access.
+The CRC32 lookup table is declared using:
 
-**Why:** `LazyLock` was stabilized in Rust 1.80 specifically to cover
-this once_cell use case in std — using it directly avoids the
-dependency entirely. (Project is built and tested with Rust 1.97.1 and Cargo 1.97.1.)
+```rust
+static TABLE: LazyLock<[u32; 256]>
+```
 
-**Tradeoff:** requires Rust ≥ 1.80; noted in README.md.
+and initialized once on first access.
+
+**Why**
+
+`once_cell` historically provided this convenient lazy-initialization functionality.
+
+Rust 1.80 stabilized:
+
+```rust
+std::sync::LazyLock
+```
+
+which directly covers StoneKV's requirement without adding a crate.
+
+**Tradeoff**
+
+This establishes StoneKV's minimum Rust version at:
+
+```text
+Rust 1.80+
+```
+
+The submitted implementation has been built and validated using:
+
+```text
+rustc 1.97.1
+cargo 1.97.1
+```
 
 ---
 
-## Substitution count
+# Zero-Dependency Verification
 
-**14 genuine substitutions**, each backed by code that ships in this
-submission — not a padded list. Every entry above can be verified by
-grepping the referenced file for the cited symbol.
+The normal dependency tree can be inspected with:
+
+```bash
+cargo tree -e normal
+```
+
+Expected structure:
+
+```text
+stone v0.1.0 (...)
+```
+
+with no third-party crates underneath it.
+
+Cargo metadata can also be inspected using:
+
+```bash
+cargo metadata --format-version 1 --no-deps
+```
+
+The repository includes a generated copy:
+
+```text
+deps-proof.txt
+```
+
+`Cargo.toml` intentionally contains:
+
+```toml
+[dependencies]
+# intentionally empty - zero third-party runtime dependencies
+```
+
+---
+
+# Substitution Count
+
+StoneKV contains:
+
+```text
+14 genuine standard-library substitutions
+```
+
+Every substitution above points to code that ships with the submission.
+
+The list is intentionally limited to functionality that is actually implemented rather than padded with hypothetical dependencies.
+
+A reviewer can verify each entry directly through the referenced source files.
+
+---
+
+# Design Philosophy
+
+The objective was not merely to make `cargo tree` small.
+
+The objective was to expose the pieces normally hidden behind dependencies:
+
+```text
+serialization
+     |
+     v
+checksums
+     |
+     v
+WAL durability
+     |
+     v
+recovery
+     |
+     v
+sorted storage
+     |
+     v
+atomic installation
+     |
+     v
+compaction
+     |
+     v
+verification
+```
+
+For StoneKV, **zero dependency means implementing and understanding the critical storage path rather than outsourcing it.**
