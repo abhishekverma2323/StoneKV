@@ -6,10 +6,21 @@ use crate::record::{Op, Record};
 use crate::segment::{SegmentReader, SegmentWriter};
 use crate::wal::Wal;
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_FLUSH_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+
+const COMPACTION_MARKER_FILE: &str = "compaction.pending";
+const COMPACTION_MARKER_TEMP_FILE: &str = "compaction.pending.tmp";
+const COMPACTION_MARKER_MAGIC: &str = "STONE_COMPACTION_V1";
+
+#[derive(Debug)]
+struct CompactionMarker {
+    output_generation: u64,
+    old_generations: Vec<u64>,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StoreStats {
@@ -56,6 +67,12 @@ impl Store {
 
         let segments_dir = dir.join("segments");
         fs::create_dir_all(&segments_dir)?;
+
+        /*
+         * Recover a compaction transaction before loading
+         * any segment into the normal store view.
+         */
+        recover_pending_compaction(&segments_dir)?;
 
         remove_stale_temp_files(&segments_dir)?;
 
@@ -144,18 +161,14 @@ impl Store {
 
     pub fn compact(&mut self) -> Result<CompactionStats> {
         /*
-         * Full compaction should include current unflushed state.
-         *
-         * Flush first so all logical data exists in immutable
-         * segments before compaction begins.
+         * Full compaction includes current unflushed state.
          */
         if !self.memtable.is_empty() {
             self.flush_memtable()?;
         }
 
         /*
-         * V2 intentionally performs no compaction when fewer than
-         * two segments exist.
+         * No useful merge when fewer than two segments exist.
          */
         if self.segments.len() < 2 {
             return Ok(CompactionStats::default());
@@ -174,10 +187,10 @@ impl Store {
         }
 
         /*
-         * self.segments is newest -> oldest.
+         * self.segments:
+         * newest -> oldest
          *
-         * compact_all requires:
-         *
+         * compact_all expects:
          * oldest -> newest
          */
         let input_paths: Vec<PathBuf> = self
@@ -187,17 +200,46 @@ impl Store {
             .map(|segment| segment.path().to_path_buf())
             .collect();
 
+        /*
+         * Record which exact generations this compaction
+         * transaction is replacing.
+         */
+        let old_generations: Vec<u64> = self
+            .segments
+            .iter()
+            .map(|segment| segment.generation())
+            .collect();
+
+        /*
+         * Build + sync the compacted temporary segment.
+         */
         let build_stats = compact_all(&input_paths, &temp_path)?;
 
         /*
-         * compact_all() already flushed + sync_all()'d
-         * the temporary segment.
+         * Write durable transaction marker BEFORE making the
+         * compacted final segment visible.
          */
-        fs::rename(&temp_path, &final_path)?;
+        if let Err(error) = write_compaction_marker(&segments_dir, generation, &old_generations) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
 
         /*
-         * Never remove old segments until the new segment
-         * has successfully opened and validated.
+         * Install new compacted segment.
+         */
+        if let Err(error) = fs::rename(&temp_path, &final_path) {
+            /*
+             * Old segments are still untouched, so rollback
+             * is safe.
+             */
+            let _ = fs::remove_file(segments_dir.join(COMPACTION_MARKER_FILE));
+            let _ = fs::remove_file(&temp_path);
+
+            return Err(error.into());
+        }
+
+        /*
+         * Validate replacement BEFORE touching old segments.
          */
         let new_reader = match SegmentReader::open(&final_path, generation) {
             Ok(reader) => reader,
@@ -209,7 +251,12 @@ impl Store {
                     error
                 ));
 
+                /*
+                 * Old segments still exist.
+                 */
                 let _ = fs::remove_file(&final_path);
+
+                let _ = fs::remove_file(segments_dir.join(COMPACTION_MARKER_FILE));
 
                 return Err(error);
             }
@@ -219,12 +266,6 @@ impl Store {
             .checked_add(1)
             .ok_or_else(|| StoneError::Other("segment generation exhausted".to_string()))?;
 
-        /*
-         * Save old filenames before dropping readers.
-         *
-         * This is important on Windows because an open File
-         * handle may prevent deletion.
-         */
         let old_paths: Vec<PathBuf> = self
             .segments
             .iter()
@@ -232,24 +273,37 @@ impl Store {
             .collect();
 
         /*
-         * Install the new compacted segment in-memory.
+         * New compacted segment becomes the in-memory
+         * authoritative segment.
          */
         let old_segments = std::mem::replace(&mut self.segments, vec![new_reader]);
 
         /*
-         * Explicitly close old segment file handles before
-         * deleting their files.
+         * Important on Windows:
+         * close old File handles before deletion.
          */
         drop(old_segments);
 
         /*
-         * New segment is already installed and valid.
+         * Marker stays present during old-file deletion.
          *
-         * Old files can now be removed.
+         * If Stone crashes here, startup sees:
+         *
+         *   compaction.pending
+         *   new compacted segment
+         *   some/all old segments
+         *
+         * and completes cleanup before normal loading.
          */
         for path in old_paths {
             fs::remove_file(path)?;
         }
+
+        /*
+         * Transaction becomes complete only after every
+         * replaced old segment has been removed.
+         */
+        fs::remove_file(segments_dir.join(COMPACTION_MARKER_FILE))?;
 
         logger::info(&format!(
             "compacted {} segments into generation {}",
@@ -258,13 +312,9 @@ impl Store {
 
         Ok(CompactionStats {
             segments_merged: build_stats.segments_read,
-
             records_before: build_stats.records_before,
-
             live_records_after: build_stats.live_records_after,
-
             bytes_before: build_stats.bytes_before,
-
             bytes_after: build_stats.bytes_after,
         })
     }
@@ -286,13 +336,9 @@ impl Store {
 
         StoreStats {
             segment_count: self.segments.len(),
-
             total_segment_bytes,
-
             wal_bytes,
-
             memtable_entries: self.memtable.len(),
-
             memtable_size_bytes: self.memtable.approx_size_bytes(),
         }
     }
@@ -306,7 +352,9 @@ impl Store {
         for segment in &mut self.segments {
             let generation = segment.generation();
 
-            // Segments must always be newest -> oldest.
+            /*
+             * Segments must always be newest -> oldest.
+             */
             if let Some(previous) = previous_generation {
                 if generation >= previous {
                     return Err(StoneError::InvalidSegmentFile {
@@ -435,6 +483,269 @@ impl Store {
         Ok(())
     }
 }
+
+/*
+ * -------------------------------------------------------------------------
+ * COMPACTION TRANSACTION MARKER
+ * -------------------------------------------------------------------------
+ */
+
+fn write_compaction_marker(
+    segments_dir: &Path,
+    output_generation: u64,
+    old_generations: &[u64],
+) -> Result<()> {
+    let marker_path = segments_dir.join(COMPACTION_MARKER_FILE);
+
+    let temp_marker_path = segments_dir.join(COMPACTION_MARKER_TEMP_FILE);
+
+    if marker_path.exists() {
+        return Err(StoneError::Other(format!(
+            "compaction marker already exists: {}",
+            marker_path.display()
+        )));
+    }
+
+    if temp_marker_path.exists() {
+        fs::remove_file(&temp_marker_path)?;
+    }
+
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_marker_path)?;
+
+        writeln!(file, "{}", COMPACTION_MARKER_MAGIC)?;
+
+        writeln!(file, "output={}", output_generation)?;
+
+        for generation in old_generations {
+            writeln!(file, "old={}", generation)?;
+        }
+
+        file.flush()?;
+
+        file.sync_all()?;
+
+        drop(file);
+
+        fs::rename(&temp_marker_path, &marker_path)?;
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_marker_path);
+    }
+
+    result
+}
+
+fn read_compaction_marker(marker_path: &Path) -> Result<CompactionMarker> {
+    let contents = fs::read_to_string(marker_path)?;
+
+    let mut lines = contents.lines();
+
+    if lines.next() != Some(COMPACTION_MARKER_MAGIC) {
+        return Err(StoneError::Other(format!(
+            "invalid compaction marker header: {}",
+            marker_path.display()
+        )));
+    }
+
+    let mut output_generation = None;
+
+    let mut old_generations = Vec::new();
+
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("output=") {
+            if output_generation.is_some() {
+                return Err(StoneError::Other(
+                    "duplicate output generation in compaction marker".to_string(),
+                ));
+            }
+
+            let generation = value.parse::<u64>().map_err(|_| {
+                StoneError::Other(format!(
+                    "invalid output generation in compaction marker: {}",
+                    value
+                ))
+            })?;
+
+            output_generation = Some(generation);
+
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("old=") {
+            let generation = value.parse::<u64>().map_err(|_| {
+                StoneError::Other(format!(
+                    "invalid old generation in compaction marker: {}",
+                    value
+                ))
+            })?;
+
+            if old_generations.contains(&generation) {
+                return Err(StoneError::Other(format!(
+                    "duplicate old generation {} in compaction marker",
+                    generation
+                )));
+            }
+
+            old_generations.push(generation);
+
+            continue;
+        }
+
+        return Err(StoneError::Other(format!(
+            "unknown line in compaction marker: {}",
+            line
+        )));
+    }
+
+    let output_generation = output_generation.ok_or_else(|| {
+        StoneError::Other("compaction marker missing output generation".to_string())
+    })?;
+
+    if old_generations.len() < 2 {
+        return Err(StoneError::Other(
+            "compaction marker must contain at least two old segments".to_string(),
+        ));
+    }
+
+    if old_generations.contains(&output_generation) {
+        return Err(StoneError::Other(
+            "compaction output generation is also listed as an old generation".to_string(),
+        ));
+    }
+
+    if old_generations
+        .iter()
+        .any(|generation| *generation >= output_generation)
+    {
+        return Err(StoneError::Other(
+            "compaction output generation must be newer than every replaced generation".to_string(),
+        ));
+    }
+
+    Ok(CompactionMarker {
+        output_generation,
+        old_generations,
+    })
+}
+
+fn recover_pending_compaction(segments_dir: &Path) -> Result<()> {
+    let marker_path = segments_dir.join(COMPACTION_MARKER_FILE);
+
+    let marker_temp_path = segments_dir.join(COMPACTION_MARKER_TEMP_FILE);
+
+    /*
+     * A temporary marker without the real marker means Stone
+     * crashed before the compaction transaction became active.
+     */
+    if !marker_path.exists() {
+        if marker_temp_path.exists() {
+            logger::warn(&format!(
+                "removing incomplete compaction marker '{}'",
+                marker_temp_path.display()
+            ));
+
+            fs::remove_file(marker_temp_path)?;
+        }
+
+        return Ok(());
+    }
+
+    /*
+     * Real marker is authoritative.
+     */
+    if marker_temp_path.exists() {
+        fs::remove_file(&marker_temp_path)?;
+    }
+
+    let marker = read_compaction_marker(&marker_path)?;
+
+    let final_path = segments_dir.join(segment_filename(marker.output_generation));
+
+    let temp_path = segments_dir.join(segment_temp_filename(marker.output_generation));
+
+    /*
+     * Marker exists but the final compacted segment does not.
+     *
+     * Stone crashed before the new segment became visible.
+     * Old segments must therefore remain authoritative.
+     */
+    if !final_path.exists() {
+        for generation in &marker.old_generations {
+            let old_path = segments_dir.join(segment_filename(*generation));
+
+            if !old_path.exists() {
+                return Err(StoneError::Other(format!(
+                    "cannot roll back interrupted compaction: \
+                     old segment {} is missing",
+                    generation
+                )));
+            }
+        }
+
+        if temp_path.exists() {
+            fs::remove_file(&temp_path)?;
+        }
+
+        fs::remove_file(&marker_path)?;
+
+        logger::warn("rolled back interrupted compaction before final segment installation");
+
+        return Ok(());
+    }
+
+    /*
+     * Final compacted segment exists.
+     *
+     * Validate it before deleting any remaining old segment.
+     */
+    {
+        let reader = SegmentReader::open(&final_path, marker.output_generation)?;
+
+        drop(reader);
+    }
+
+    /*
+     * Valid compacted segment is authoritative.
+     *
+     * Finish removal of all old generations before normal
+     * Store loading is allowed.
+     */
+    for generation in &marker.old_generations {
+        let old_path = segments_dir.join(segment_filename(*generation));
+
+        if old_path.exists() {
+            fs::remove_file(old_path)?;
+        }
+    }
+
+    if temp_path.exists() {
+        fs::remove_file(temp_path)?;
+    }
+
+    fs::remove_file(marker_path)?;
+
+    logger::warn("completed recovery of interrupted compaction");
+
+    Ok(())
+}
+
+/*
+ * -------------------------------------------------------------------------
+ * STORE HELPERS
+ * -------------------------------------------------------------------------
+ */
 
 fn apply_record(memtable: &mut Memtable, record: &Record) {
     match record.op {
@@ -579,7 +890,7 @@ mod tests {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
 
         std::env::temp_dir().join(format!(
-            "stone_store_v3_test_{}_{}_{}",
+            "stone_store_v4_test_{}_{}_{}",
             std::process::id(),
             id,
             name
@@ -641,7 +952,7 @@ mod tests {
 
             assert_eq!(store.get(b"key").unwrap(), Some(b"value".to_vec()));
 
-            assert_eq!(fs::metadata(dir.join("wal.log"),).unwrap().len(), 0);
+            assert_eq!(fs::metadata(dir.join("wal.log")).unwrap().len(), 0);
         }
 
         cleanup(&dir);
@@ -710,9 +1021,7 @@ mod tests {
             let mut store = Store::open_with_threshold(&dir, 1).unwrap();
 
             store.set(b"a", b"1").unwrap();
-
             store.set(b"b", b"2").unwrap();
-
             store.set(b"a", b"3").unwrap();
 
             assert_eq!(store.segment_count(), 3);
@@ -743,7 +1052,6 @@ mod tests {
             let mut store = Store::open_with_threshold(&dir, 1).unwrap();
 
             store.set(b"a", b"1").unwrap();
-
             store.set(b"b", b"2").unwrap();
 
             store.set(b"a", b"updated").unwrap();
@@ -833,10 +1141,6 @@ mod tests {
 
             let stats = store.compact().unwrap();
 
-            /*
-             * Flushing created only one segment,
-             * so full compaction itself is a no-op.
-             */
             assert_eq!(stats, CompactionStats::default());
 
             assert_eq!(store.segment_count(), 1);
@@ -942,18 +1246,10 @@ mod tests {
             let mut store = Store::open_with_threshold(&dir, 1).unwrap();
 
             store.set(b"a", b"1").unwrap();
-
             store.set(b"b", b"2").unwrap();
 
             store.compact().unwrap();
 
-            /*
-             * Generations:
-             *
-             * 1 = a
-             * 2 = b
-             * 3 = compacted
-             */
             assert!(dir
                 .join("segments")
                 .join("segment_00000000000000000003.seg")
@@ -987,6 +1283,167 @@ mod tests {
         }
 
         assert!(!temp.exists());
+
+        cleanup(&dir);
+    }
+
+    /*
+     * ---------------------------------------------------------------------
+     * NEW COMPACTION CRASH-SAFETY TEST
+     * ---------------------------------------------------------------------
+     */
+
+    #[test]
+    fn interrupted_compaction_does_not_resurrect_deleted_key() {
+        let dir = temp_dir("compaction_crash_delete");
+
+        {
+            let mut store = Store::open_with_threshold(&dir, 1).unwrap();
+
+            /*
+             * generation 1:
+             *
+             * key = value
+             */
+            store.set(b"key", b"value").unwrap();
+
+            /*
+             * generation 2:
+             *
+             * key = tombstone
+             */
+            store.delete(b"key").unwrap();
+
+            assert_eq!(store.segment_count(), 2);
+
+            assert_eq!(store.get(b"key").unwrap(), None);
+
+            let generation = store.next_segment_generation;
+
+            let segments_dir = dir.join("segments");
+
+            let temp_path = segments_dir.join(segment_temp_filename(generation));
+
+            let final_path = segments_dir.join(segment_filename(generation));
+
+            let input_paths: Vec<PathBuf> = store
+                .segments
+                .iter()
+                .rev()
+                .map(|segment| segment.path().to_path_buf())
+                .collect();
+
+            let old_generations: Vec<u64> = store
+                .segments
+                .iter()
+                .map(|segment| segment.generation())
+                .collect();
+
+            /*
+             * Build compacted segment.
+             *
+             * Final logical state is DELETE, therefore
+             * compacted segment contains no live key.
+             */
+            compact_all(&input_paths, &temp_path).unwrap();
+
+            /*
+             * Start compaction transaction.
+             */
+            write_compaction_marker(&segments_dir, generation, &old_generations).unwrap();
+
+            /*
+             * Simulated crash point:
+             *
+             * New segment is now visible, but old
+             * segments have NOT been deleted yet.
+             */
+            fs::rename(&temp_path, &final_path).unwrap();
+
+            /*
+             * Store drops here, simulating process death.
+             */
+        }
+
+        /*
+         * Startup must finish interrupted compaction
+         * BEFORE normal segment loading.
+         */
+        {
+            let mut reopened = Store::open(&dir).unwrap();
+
+            assert_eq!(reopened.segment_count(), 1);
+
+            /*
+             * Critical assertion:
+             *
+             * Deleted value must never resurrect from one
+             * of the old segments.
+             */
+            assert_eq!(reopened.get(b"key").unwrap(), None);
+
+            assert!(!dir.join("segments").join(COMPACTION_MARKER_FILE).exists());
+        }
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn interrupted_compaction_before_install_rolls_back() {
+        let dir = temp_dir("compaction_crash_before_install");
+
+        {
+            let mut store = Store::open_with_threshold(&dir, 1).unwrap();
+
+            store.set(b"a", b"1").unwrap();
+
+            store.set(b"b", b"2").unwrap();
+
+            let generation = store.next_segment_generation;
+
+            let segments_dir = dir.join("segments");
+
+            let temp_path = segments_dir.join(segment_temp_filename(generation));
+
+            let input_paths: Vec<PathBuf> = store
+                .segments
+                .iter()
+                .rev()
+                .map(|segment| segment.path().to_path_buf())
+                .collect();
+
+            let old_generations: Vec<u64> = store
+                .segments
+                .iter()
+                .map(|segment| segment.generation())
+                .collect();
+
+            compact_all(&input_paths, &temp_path).unwrap();
+
+            write_compaction_marker(&segments_dir, generation, &old_generations).unwrap();
+
+            /*
+             * Simulated crash BEFORE:
+             *
+             * temp -> final rename
+             */
+        }
+
+        {
+            let mut reopened = Store::open(&dir).unwrap();
+
+            /*
+             * Recovery must roll back and retain both
+             * original segments.
+             */
+            assert_eq!(reopened.segment_count(), 2);
+
+            assert_eq!(reopened.get(b"a").unwrap(), Some(b"1".to_vec()));
+
+            assert_eq!(reopened.get(b"b").unwrap(), Some(b"2".to_vec()));
+
+            assert!(!dir.join("segments").join(COMPACTION_MARKER_FILE).exists());
+        }
 
         cleanup(&dir);
     }
