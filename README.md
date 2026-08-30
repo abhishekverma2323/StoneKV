@@ -50,6 +50,19 @@ Its goal is simple:
 
 ---
 
+# Bonus Claims
+
+This submission claims two bonus challenges:
+
+| Challenge | Points | Evidence |
+|---|---|---|
+| **STDLIB Log** | +3 | [`STDLIB.md`](STDLIB.md) documents 14 real, non-trivial stdlib-for-package substitutions — above the 10 required — each with the package it replaces, the standard-library alternative used, why, and the tradeoff accepted. |
+| **Reproducible Build** | +5 | [`REPRODUCIBLE.md`](REPRODUCIBLE.md) documents two independent, fully clean release builds on the same machine and toolchain producing byte-identical SHA-256 hashes, with the exact commands, environment, and both published hashes. |
+
+Neither bonus is claimed speculatively — both are backed by evidence a judge can reproduce with the commands documented in the linked files.
+
+---
+
 # Judge Quick Check
 
 A reviewer can verify the core claims without reading the implementation.
