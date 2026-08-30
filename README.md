@@ -798,6 +798,8 @@ Important cases include:
 | Marker and final compacted segment exist           | Replacement is revalidated, then cleanup rolls forward |
 | Old segments are already gone but marker remains   | Marker is removed                                      |
 
+This is not a hypothetical crash window. The gap between installing a compacted file and finishing cleanup of the files it replaces is a known failure class in production LSM-tree storage engines — both RocksDB and LevelDB have shipped real fixes for versions of this exact problem, generally involving a manifest or version-set mechanism far more elaborate than what a 72-hour project can build. `compaction.pending` is a small, from-scratch answer to the same category of bug: it is deliberately simpler than a full manifest, but it is verified under simulated interruption at every stage of the transaction (see `store::tests::interrupted_compaction_before_install_rolls_back` and `store::tests::interrupted_compaction_does_not_resurrect_deleted_key`).
+
 The key invariant is:
 
 > **Never delete data until its replacement has been written and successfully validated.**
