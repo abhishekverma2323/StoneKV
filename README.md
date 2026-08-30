@@ -208,6 +208,32 @@ target\release\stone.exe
 target/release/stone
 ```
 
+### A note on Windows Smart App Control
+
+On a fresh Windows 11 installation, Smart App Control may be enabled by default. It can intermittently block execution of freshly-compiled, unsigned `.exe` files under `target\release\deps\` — this affects `cargo test`'s internal test-harness binaries, not the `stone.exe` release binary itself, which runs normally under Smart App Control in our own testing.
+
+If `cargo test` reports an error like:
+
+```text
+An Application Control policy has blocked this file. (os error 4551)
+```
+
+the release binary is still fully usable — try running it directly:
+
+```powershell
+.\target\release\stone.exe set hello world
+```
+
+If tests specifically need to run and are blocked, the most reliable workaround is running the same commands from WSL (Windows Subsystem for Linux), which is unaffected by this Windows-specific policy:
+
+```bash
+wsl
+cd /mnt/c/path/to/StoneKV   # or wherever the repo is checked out
+cargo test --release
+```
+
+This is a Windows OS behavior, not a StoneKV defect — the binaries themselves are unmodified between runs.
+
 ---
 
 # Quick Start
