@@ -182,8 +182,6 @@ Using `--dir` lets reviewers create isolated stores without modifying the defaul
 * **Validated environment:** `rustc 1.97.1` and `cargo 1.97.1`
 * No third-party Rust crates
 
-Rust 1.80+ is required because StoneKV uses `std::sync::LazyLock`.
-
 ---
 
 ## Build
@@ -208,31 +206,22 @@ target\release\stone.exe
 target/release/stone
 ```
 
-### A note on Windows Smart App Control
+### Windows test execution note
 
-On a fresh Windows 11 installation, Smart App Control may be enabled by default. It can intermittently block execution of freshly-compiled, unsigned `.exe` files under `target\release\deps\` — this affects `cargo test`'s internal test-harness binaries, not the `stone.exe` release binary itself, which runs normally under Smart App Control in our own testing.
-
-If `cargo test` reports an error like:
+On some Windows 11 systems with Smart App Control enabled, freshly-compiled Cargo test-harness executables may be blocked, reporting:
 
 ```text
 An Application Control policy has blocked this file. (os error 4551)
 ```
 
-the release binary is still fully usable — try running it directly:
-
-```powershell
-.\target\release\stone.exe set hello world
-```
-
-If tests specifically need to run and are blocked, the most reliable workaround is running the same commands from WSL (Windows Subsystem for Linux), which is unaffected by this Windows-specific policy:
+This was observed during StoneKV development and confirmed in Windows Event Viewer as Smart App Control (Event ID 3118, "Smart App Control Block Details"). If encountered, run the test suite unchanged under WSL:
 
 ```bash
-wsl
-cd /mnt/c/path/to/StoneKV   # or wherever the repo is checked out
-cargo test --release
+cd /mnt/c/path/to/StoneKV
+cargo test
 ```
 
-This is a Windows OS behavior, not a StoneKV defect — the binaries themselves are unmodified between runs.
+The `stone.exe` release binary itself was separately validated running directly on the same Windows machine without issue.
 
 ---
 
@@ -1027,7 +1016,7 @@ The harness measures:
 | CPU | 12th Gen Intel(R) Core(TM) i5-1235U |
 | OS | Windows 11 + WSL2 (Ubuntu), benchmark directory on `/dev/sdd` (ext4) |
 | Rust | `rustc 1.97.1` |
-| Build | `cargo bench` (release profile) |
+| Build | `cargo bench` (optimized bench profile) |
 
 | Operation | Result |
 |---|---|
